@@ -11,3 +11,7 @@ agents_category_id = "000000000000000003"
 upload_roots = ['C:\Users\YOUR_NAME\Projects']
 # Optional additional channels agents may read. Own thread/project are implicit.
 read_channel_ids = ["000000000000000004"]
+# Optional: alert when a linked session's turn lasts at least this many minutes (default 10, integer >= 1).
+long_turn_minutes = 10
+# Optional: ping only the configured owner in attention/turn-finished alerts (default true, boolean).
+alert_mentions_owner = true

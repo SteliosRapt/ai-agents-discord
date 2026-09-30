@@ -4,7 +4,46 @@ import json
 from pathlib import Path
 import re
 import sys
+import time
 import agent_state
+
+def post_alert(host, row, payload):
+    """Only linked, eligible hook events load config or the bot client."""
+    event = payload['hook_event_name']
+    if not row['thread_id']:
+        return 0
+    if host == 'claude' and event == 'Notification':
+        text = '⏳ Needs your attention: ' + (payload.get('message') or '')[:300]
+    elif host == 'codex' and event == 'PermissionRequest':
+        summary = (payload.get('tool_name', '') + ' ' + json.dumps(payload.get('tool_input', {}), ensure_ascii=False))[:300]
+        text = '⏳ Codex is waiting for approval: ' + summary
+    elif event == 'Stop' and row['last_prompt_at'] is not None:
+        text = None
+    else:
+        return 0
+    stage = 'load alert config'
+    try:
+        config = agent_state.load_config()
+        if text is None:
+            minutes = (row['last_seen'] - row['last_prompt_at']) / 60
+            if minutes < config['long_turn_minutes']:
+                return 0
+            text = f'✅ Turn finished after {int(minutes)} min'
+            message = payload.get('last_assistant_message')
+            if message:
+                text += ': ' + message[:300]
+        users = (config['owner_user_id'],) if config['alert_mentions_owner'] else ()
+        if users:
+            text = f'<@{users[0]}> ' + text
+        stage = 'post Discord alert'
+        from bot_client import BotClient
+        BotClient(config['guild_id']).send_message(row['thread_id'], text, mention_users=users)
+        return 0
+    except Exception as exc:
+        # Exception text may contain credentials from an HTTP/config failure. Never echo it.
+        print(f'AI Agents could not {stage} ({type(exc).__name__}); check config.toml and bot setup; '
+              'check Discord before retrying because delivery may be uncertain.', file=sys.stderr)
+        return 1
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -23,10 +62,12 @@ def main():
             print('Missing or invalid required hook field: ' + key, file=sys.stderr)
             return 1
     session_id, event = payload['session_id'], payload['hook_event_name']
+    event_at = time.time()
     agent_state.ROOT.mkdir(parents=True, exist_ok=True)
     state = agent_state.State()
     try:
-        state.touch_host_session(args.host, session_id, payload['cwd'], agent_state.host_process_pid(), event)
+        state.confirm_inbox(session_id, event, event_at)
+        row = state.touch_host_session(args.host, session_id, payload['cwd'], agent_state.host_process_pid(), event)
         tool = payload.get('tool_name', '')
         if event == 'PostToolUse' and 'start_session' in tool and ('ai-agents' in tool or 'ai_agents' in tool):
             response = json.dumps(payload.get('tool_response'))
@@ -35,12 +76,13 @@ def main():
             if mcp and thread:
                 state.link_host_session(session_id, mcp.group(1), thread.group(1), (payload.get('tool_input') or {}).get('title'))
         if event in ('PostToolUse', 'UserPromptSubmit'):
-            rows = state.take_inbox(session_id)
+            rows = state.take_inbox(session_id, retry_before=event_at, event=event)
             if rows:
                 text = 'AI Agents inbox: the owner sent you these via Discord /send\n'
-                text += '\n'.join(f'{Path(row["path"]).resolve()}: {row["note"] or ""}' for row in rows)
-                print(json.dumps({'hookSpecificOutput': {'hookEventName': event, 'additionalContext': text}}))
-        return 0
+                text += '\n'.join(f'{Path(item["path"]).resolve()}: {item["note"] or ""}'
+                                  + (' (re-sent)' if item['delivered_at'] is not None else '') for item in rows)
+                print(json.dumps({'hookSpecificOutput': {'hookEventName': event, 'additionalContext': text}}), flush=True)
+        return post_alert(args.host, row, payload)
     finally:
         state.close()
 

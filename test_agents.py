@@ -399,6 +399,27 @@ class ClientTests(unittest.TestCase):
                     action()
             http.assert_not_called()
 
+    def test_explicit_mention_users_and_default_mentions(self):
+        for users, expected in [((), {'parse': []}), (('2',), {'parse': [], 'users': ['2']})]:
+            with self.subTest(users=users), patch.object(bot.urllib.request, 'urlopen', return_value=io.BytesIO(b'{"id":"1"}')) as http:
+                self.client.send_message('100', '<@2> @everyone <@&3>', mention_users=users)
+                payload = json.loads(http.call_args.args[0].data)
+                self.assertEqual(payload['allowed_mentions'], expected)
+        with patch.object(bot.urllib.request, 'urlopen') as http:
+            with self.assertRaisesRegex(ValueError, 'digits only'):
+                self.client.send_message('100', 'Hello', mention_users=('everyone',))
+            http.assert_not_called()
+
+    def test_explicit_mentions_with_files_and_reply(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'file.txt'
+            path.write_text('offline', encoding='utf-8')
+            with patch.object(bot.urllib.request, 'urlopen', return_value=io.BytesIO(b'{"id":"1"}')) as http:
+                self.client.send_message('100', '<@2> Hello', [path], reply_to='99', mention_users=('2',))
+        body = http.call_args.args[0].data
+        self.assertIn(b'"allowed_mentions": {"parse": [], "users": ["2"]}', body)
+        self.assertIn(b'"message_reference": {"message_id": "99"}', body)
+
     def test_size_errors(self):
         for status, code in ((413, 0), (400, 40005)):
             error = urllib.error.HTTPError('offline', status, TOKEN, {}, io.BytesIO(json.dumps({'code': code}).encode()))
@@ -476,8 +497,30 @@ class ConfigStateTests(unittest.TestCase):
             root = Path(d)
             write_config(root)
             config = agent_state.load_config(root)
-            self.assertEqual(set(config), {'guild_id', 'owner_user_id', 'agents_category_id', 'upload_roots', 'read_channel_ids'})
+            self.assertEqual(set(config), {'guild_id', 'owner_user_id', 'agents_category_id', 'upload_roots', 'read_channel_ids',
+                                          'long_turn_minutes', 'alert_mentions_owner'})
             self.assertEqual(config['upload_roots'], [(root / 'uploads').resolve()])
+            self.assertEqual(config['long_turn_minutes'], 10)
+            self.assertIs(config['alert_mentions_owner'], True)
+
+    def test_alert_config_values_and_invalid_types(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            write_config(root, long_turn_minutes=1, alert_mentions_owner=False)
+            config = agent_state.load_config(root)
+            self.assertEqual(config['long_turn_minutes'], 1)
+            self.assertIs(config['alert_mentions_owner'], False)
+            write_config(root, long_turn_minutes=2)
+            self.assertIs(agent_state.load_config(root)['alert_mentions_owner'], True)
+            write_config(root, alert_mentions_owner=False)
+            self.assertEqual(agent_state.load_config(root)['long_turn_minutes'], 10)
+            for key, values in [('long_turn_minutes', [True, False, 0, -1, 1.5, '10', []]),
+                                ('alert_mentions_owner', [0, 1, 'true', [], {}])]:
+                for value in values:
+                    with self.subTest(key=key, value=value):
+                        write_config(root, **{key: value})
+                        with self.assertRaisesRegex(ValueError, key):
+                            agent_state.load_config(root)
 
     def test_missing_config_and_every_required_key(self):
         with tempfile.TemporaryDirectory() as d:
@@ -564,7 +607,9 @@ class ConfigStateTests(unittest.TestCase):
         with (root / 'config.example.toml').open('rb') as file:
             config = agent_state.tomllib.load(file)
         self.assertEqual(set(config), {'guild_id', 'owner_user_id', 'agents_category_id', 'upload_roots',
-                                      'read_channel_ids'})
+                                      'read_channel_ids', 'long_turn_minutes', 'alert_mentions_owner'})
+        self.assertEqual(config['long_turn_minutes'], 10)
+        self.assertIs(config['alert_mentions_owner'], True)
 
 if __name__ == '__main__':
     unittest.main()
