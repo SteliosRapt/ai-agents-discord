@@ -129,7 +129,7 @@ py run_and_notify.py --name "My job" -- py "C:\path\job.py"
 
 Python 3.10+ is required. Basic messages and attachments use only the standard library. Video compression additionally needs FFmpeg (with libx264) and ffprobe on PATH; alternatively pass `--ffmpeg C:\path\ffmpeg.exe --ffprobe C:\path\ffprobe.exe`. Get FFmpeg through https://ffmpeg.org/download.html. Compression uses the source video's measured duration, preserves audio if present, and writes separate copies beside the source. No images or previews are generated for review.
 
-To configure another webhook, run `python discord_client.py setup`. Paste its URL at the hidden prompt. Create webhooks in Discord server settings → Integrations → Webhooks, choose the intended channel, and copy the URL. Webhooks post to their configured destination; channel names in scripts do not redirect them.
+To configure another webhook, run `py discord_client.py setup`. Paste its URL at the hidden prompt. Create webhooks in Discord server settings → Integrations → Webhooks, choose the intended channel, and copy the URL. Webhooks post to their configured destination; channel names in scripts do not redirect them.
 
 ## Credentials and Windows execution
 
@@ -178,4 +178,4 @@ Discord receiving a message does not prove the iPhone displayed a push alert. En
 
 ## Validation
 
-Run `python test_toolkit.py` for offline tests of multipart construction, rate-limit retry, oversized upload handling, credential encryption, and conditional video tiers. These tests do not post to Discord. The underlying webhook and DPAPI technique successfully delivered a live test in the original setup. Generic video transcoding requires FFmpeg and has not been exercised on a real movie as part of creating this toolkit; no original render was inspected or changed.
+Run `py test_toolkit.py` (and `test_agents`, `test_hooks`, `test_gateway`, `test_daemon`, `test_jobs`) for offline tests of multipart construction, rate-limit retry, oversized upload handling, credential encryption, and conditional video tiers. These tests do not post to Discord. The underlying webhook and DPAPI technique successfully delivered a live test in the original setup. Generic video transcoding requires FFmpeg and has not been exercised on a real movie as part of creating this toolkit; no original render was inspected or changed.
