@@ -69,7 +69,7 @@ py ai_agents_daemon.py install-autostart      # Task Scheduler: start hidden (py
 py ai_agents_daemon.py uninstall-autostart
 ```
 
-- **`/agents`:** lists running Claude Code/Codex sessions. Each line shows a 4-character handle, the app, the project folder, the Discord task title and thread (if any), and the last activity. Only you see it.
+- **`/agents`:** lists running Claude Code/Codex sessions, sorted **⏳ waiting** (turn finished or approval needed) → **⚙️ working** (active in the last 10 min) → **💤 idle**. Each line shows a 4-character handle, the app, the project folder, the Discord task title and thread (if any), and the last activity. Only you see it.
 - **`/send agent:<handle> file:<attachment> note:<text>`:**
   - The handle autocompletes.
   - The file is saved to `%USERPROFILE%\.ai-agents\inbox\<handle>\`, and the session's thread (if any) gets a visible note.
@@ -97,6 +97,17 @@ Both keys are optional in `config.toml`.
 - At the end it edits the message and posts a new ✅/❌ message, which does notify. A failure attaches the last 60 log lines.
 - The full log goes to `%USERPROFILE%\.ai-agents\jobs\`, or to `--log`. The script exits with the command's exit code.
 
+### Smoke test (live, never posts)
+`py smoke_test.py` checks every real entry point with **GET requests only** and prints PASS/FAIL per check:
+- config, token and Discord access
+- the Message Content intent and private-bot setting
+- the registered commands
+- the MCP handshake under both apps' exact launch configs (Codex's environment allowlist and working folder included)
+- every hook command string through Git Bash, PowerShell and cmd, with a Greek/emoji working folder, in a temporary data folder
+- whether the listener is connected
+
+`--offline-only` skips the network checks. Run it after any change or update.
+
 ### Tested
 - **Offline:** `py test_toolkit.py`, `py test_agents.py`.
 - **Live, 2026-09-30:** one end-to-end run through the stdio MCP server against the real server:
@@ -116,6 +127,7 @@ Both keys are optional in `config.toml`.
     - the listener reconnected and resumed on its own overnight
     - the hook stores a Greek/emoji working folder correctly
     - Codex 0.4.0 installed
+- **Phase 5, live 2026-10-01:** `py smoke_test.py`: all 9 checks PASS (including 30/30 hook runs across three shells and both MCP launch configs).
 - **Trust assumption:** `%USERPROFILE%\.ai-agents` and its parent folders are not writable by anyone else.
 - **Not yet tested live:**
   - `/agents` and `/send` issued from Discord (needs the owner)
