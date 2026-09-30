@@ -65,6 +65,7 @@ def main():
     event_at = time.time()
     agent_state.ROOT.mkdir(parents=True, exist_ok=True)
     state = agent_state.State()
+    inbox_output = False
     try:
         state.confirm_inbox(session_id, event, event_at)
         row = state.touch_host_session(args.host, session_id, payload['cwd'], agent_state.host_process_pid(), event)
@@ -82,9 +83,11 @@ def main():
                 text += '\n'.join(f'{Path(item["path"]).resolve()}: {item["note"] or ""}'
                                   + (' (re-sent)' if item['delivered_at'] is not None else '') for item in rows)
                 print(json.dumps({'hookSpecificOutput': {'hookEventName': event, 'additionalContext': text}}), flush=True)
+                inbox_output = True
         return post_alert(args.host, row, payload)
     finally:
-        state.close()
+        # Keep inbox claims active until context output and all remaining hook duties have finished.
+        state.close(inbox_delivered=inbox_output)
 
 if __name__ == '__main__':
     sys.exit(main())

@@ -116,22 +116,106 @@ class StateTests(unittest.TestCase):
         self.state.db.execute('DROP TRIGGER reject_delivery')
         self.assertEqual(len(self.state.take_inbox('one')), 1)
 
-    def test_concurrent_retry_cutoff_does_not_replay_this_events_delivery(self):
+    def test_staggered_events_do_not_retry_an_active_delivery(self):
         item = self.state.add_inbox('one', self.root / 'file.txt', 'note', 'owner')
         other = agent_state.State(self.root)
         self.addCleanup(other.close)
-        barrier = threading.Barrier(2)
-        def take(state):
-            barrier.wait(timeout=5)
-            return [row['id'] for row in state.take_inbox('one', retry_before=100, event='UserPromptSubmit')]
-        with patch.object(agent_state.time, 'time', return_value=100), ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(take, state) for state in (self.state, other)]
-            results = [future.result(timeout=10) for future in futures]
-        self.assertEqual(results[0] + results[1], [item])
-        with patch.object(agent_state.time, 'time', return_value=200):
-            replay = self.state.take_inbox('one', retry_before=200, event='PostToolUse')
+        committed, resume = threading.Event(), threading.Event()
+        db = self.state.db
+        class PausedCommit:
+            def execute(self, sql, *args):
+                result = db.execute(sql, *args)
+                if sql == 'COMMIT':
+                    committed.set()
+                    if not resume.wait(timeout=5):
+                        raise AssertionError('first take was not resumed')
+                return result
+            def __getattr__(self, name):
+                return getattr(db, name)
+        self.state.db = PausedCommit()
+        with patch.object(agent_state.time, 'time', side_effect=lambda: 100 if threading.current_thread().name.startswith('first-take') else 101), ThreadPoolExecutor(max_workers=1, thread_name_prefix='first-take') as pool:
+            first = pool.submit(self.state.take_inbox, 'one', retry_before=100, event='UserPromptSubmit')
+            try:
+                self.assertTrue(committed.wait(timeout=5))
+                self.assertFalse(first.done())
+                # The second event starts later, after the first claim was committed.
+                self.assertEqual(other.take_inbox('one', retry_before=101, event='UserPromptSubmit'), [])
+                other.confirm_inbox('one', 'Stop', 101)
+                self.assertIsNone(other.db.execute('SELECT confirmed_at FROM inbox WHERE id=?', (item,)).fetchone()[0])
+            finally:
+                resume.set()
+            self.assertEqual([row['id'] for row in first.result(timeout=5)], [item])
+        self.state.db = db
+        self.assertEqual(other.take_inbox('one', retry_before=102, event='UserPromptSubmit'), [])
+        with patch.object(agent_state.time, 'time', return_value=102):
+            self.state.finish_inbox()
+        # A delayed take from the already-overlapping event must also stay empty after release.
+        self.assertEqual(other.take_inbox('one', retry_before=101, event='UserPromptSubmit'), [])
+        with patch.object(agent_state.time, 'time', return_value=103):
+            replay = other.take_inbox('one', retry_before=103, event='PostToolUse')
         self.assertEqual([row['id'] for row in replay], [item])
-        self.assertEqual(replay[0]['delivered_at'], 100)
+        self.assertEqual(replay[0]['delivered_at'], 102)
+
+    def test_delivery_claims_are_released_only_by_their_owner(self):
+        first = self.state.add_inbox('one', 'first.txt', 'first', 'owner')
+        self.state.take_inbox('one', event='UserPromptSubmit')
+        second = self.state.add_inbox('one', 'second.txt', 'second', 'owner')
+        other = agent_state.State(self.root)
+        self.addCleanup(other.close)
+        self.assertEqual([row['id'] for row in other.take_inbox('one', event='UserPromptSubmit')], [second])
+        self.state.finish_inbox()
+        rows = {row['id']: row for row in self.state.db.execute('SELECT * FROM inbox')}
+        self.assertIsNone(rows[first]['delivery_pid'])
+        self.assertIsNone(rows[first]['delivery_owner'])
+        self.assertEqual(rows[second]['delivery_pid'], os.getpid())
+        self.assertIsNotNone(rows[second]['delivery_owner'])
+
+    def test_dead_delivery_owner_is_replayed_not_prematurely_confirmed(self):
+        item = self.state.add_inbox('one', 'file.txt', 'note', 'owner')
+        self.state.db.execute("UPDATE inbox SET delivered_at=100, delivered_event='PostToolUse', delivery_pid=999, delivery_owner='abandoned'")
+        self.state.confirm_inbox('one', 'Stop', 101)
+        self.assertIsNone(self.state.db.execute('SELECT confirmed_at FROM inbox').fetchone()[0])
+        with patch.object(agent_state, 'process_alive', return_value=False) as alive, patch.object(agent_state.time, 'time', return_value=101):
+            rows = self.state.take_inbox('one', retry_before=101, event='PostToolUse')
+        alive.assert_called_once_with(999)
+        self.assertEqual([(row['id'], row['delivered_at']) for row in rows], [(item, 100)])
+        with patch.object(agent_state.time, 'time', return_value=102):
+            self.state.finish_inbox()
+        self.state.confirm_inbox('one', 'PostToolUse', 103)
+        self.assertEqual(self.state.take_inbox('one', retry_before=104, event='UserPromptSubmit'), [])
+
+    def test_delivery_liveness_failure_rolls_back_and_raises(self):
+        self.state.add_inbox('one', 'file.txt', 'note', 'owner')
+        self.state.db.execute("UPDATE inbox SET delivered_at=100, delivery_pid=999, delivery_owner='abandoned'")
+        with patch.object(agent_state, 'process_alive', side_effect=RuntimeError('Cannot query delivery process')):
+            with self.assertRaisesRegex(RuntimeError, 'Cannot query delivery process'):
+                self.state.take_inbox('one', retry_before=101, event='UserPromptSubmit')
+        self.assertFalse(self.state.db.in_transaction)
+        self.assertEqual(self.state.db.execute('SELECT delivery_owner FROM inbox').fetchone()[0], 'abandoned')
+
+    def test_failed_replay_restores_the_previous_delivery(self):
+        self.state.add_inbox('one', 'file.txt', 'note', 'owner')
+        self.state.db.execute("UPDATE inbox SET delivered_at=100, delivered_event='UserPromptSubmit'")
+        with patch.object(agent_state.time, 'time', return_value=101):
+            self.state.take_inbox('one', retry_before=101, event='PostToolUse')
+        self.state.finish_inbox(delivered=False)
+        row = self.state.db.execute('SELECT * FROM inbox').fetchone()
+        self.assertEqual((row['delivered_at'], row['delivered_event'], row['delivery_pid'], row['delivery_owner']),
+                         (100, 'UserPromptSubmit', None, None))
+
+    def test_failed_replay_restores_an_abandoned_claim_for_later_recovery(self):
+        self.state.add_inbox('one', 'file.txt', 'note', 'owner')
+        self.state.db.execute("UPDATE inbox SET delivered_at=100, delivered_event='PostToolUse', delivery_pid=999, delivery_owner='abandoned'")
+        with patch.object(agent_state, 'process_alive', return_value=False):
+            self.state.take_inbox('one', retry_before=101, event='PostToolUse')
+        self.state.finish_inbox(delivered=False)
+        row = self.state.db.execute('SELECT * FROM inbox').fetchone()
+        self.assertEqual((row['delivered_at'], row['delivered_event'], row['delivery_pid'], row['delivery_owner']),
+                         (100, 'PostToolUse', 999, 'abandoned'))
+        self.state.confirm_inbox('one', 'Stop', 102)
+        self.assertIsNone(self.state.db.execute('SELECT confirmed_at FROM inbox').fetchone()[0])
+        with patch.object(agent_state, 'process_alive', return_value=False):
+            self.assertEqual(len(self.state.take_inbox('one', retry_before=102, event='PostToolUse')), 1)
 
     def test_phase_two_schema_migrates_existing_host_and_inbox_rows(self):
         with tempfile.TemporaryDirectory() as d:
@@ -163,6 +247,8 @@ class StateTests(unittest.TestCase):
                     state.confirm_inbox('old-host', 'PostToolUse', 10)
                     rows = state.take_inbox('old-host', retry_before=10, event='PostToolUse')
                 self.assertEqual([(row['id'], row['delivered_at']) for row in rows], [(1, None), (2, 2)])
+                with patch.object(agent_state.time, 'time', return_value=10):
+                    state.finish_inbox()
                 state.confirm_inbox('old-host', 'PostToolUse', 11)
                 self.assertEqual(state.take_inbox('old-host', retry_before=12, event='PostToolUse'), [])
             finally:
@@ -223,7 +309,7 @@ class StateTests(unittest.TestCase):
                 self.assertEqual([row[1] for row in state.db.execute('PRAGMA table_info(host_sessions)')],
                                  ['host_session_id', 'host', 'handle', 'cwd', 'host_pid', 'started_at', 'last_seen', 'last_event', 'ended_at', 'mcp_session_id', 'thread_id', 'title', 'last_prompt_at'])
                 self.assertEqual([row[1] for row in state.db.execute('PRAGMA table_info(inbox)')],
-                                 ['id', 'host_session_id', 'path', 'note', 'sender_id', 'created_at', 'delivered_at', 'confirmed_at', 'delivered_event'])
+                                 ['id', 'host_session_id', 'path', 'note', 'sender_id', 'created_at', 'delivered_at', 'confirmed_at', 'delivered_event', 'delivery_pid', 'delivery_owner'])
             finally:
                 state.close()
 
@@ -373,6 +459,38 @@ class HookTests(unittest.TestCase):
                 with patch.object(agent_state.time, 'time', return_value=400):
                     self.assertEqual(self.run_hook('UserPromptSubmit', session_id=session), (0, '', ''))
                 self.assertEqual(self.state.db.execute('SELECT confirmed_at FROM inbox WHERE id=?', (item,)).fetchone()[0], 300)
+
+    def test_hook_retains_delivery_claim_through_remaining_duties(self):
+        self.state.add_inbox('host-1', self.root / 'file.txt', 'Read first', 'owner')
+        other = agent_state.State(self.root)
+        self.addCleanup(other.close)
+        def remaining_duties(host, row, payload):
+            self.assertIn('Read first', sys.stdout.getvalue())
+            self.assertEqual(other.take_inbox('host-1', retry_before=101, event='UserPromptSubmit'), [])
+            other.confirm_inbox('host-1', 'Stop', 101)
+            self.assertIsNone(other.db.execute('SELECT confirmed_at FROM inbox').fetchone()[0])
+            return 0
+        with patch.object(agent_state.time, 'time', return_value=100), patch.object(session_hook, 'post_alert', side_effect=remaining_duties):
+            self.assertEqual(self.run_hook('UserPromptSubmit')[0], 0)
+        row = self.state.db.execute('SELECT * FROM inbox').fetchone()
+        self.assertIsNone(row['delivery_pid'])
+        self.assertIsNone(row['delivery_owner'])
+        with patch.object(agent_state.time, 'time', return_value=102):
+            self.assertIn('(re-sent)', self.run_hook('UserPromptSubmit')[1])
+
+    def test_failed_stdout_restores_pending_delivery(self):
+        self.state.add_inbox('host-1', self.root / 'file.txt', 'Read first', 'owner')
+        with patch.object(session_hook, 'print', create=True, side_effect=OSError('offline stdout failure')):
+            with self.assertRaisesRegex(OSError, 'offline stdout failure'):
+                self.run_hook('PostToolUse')
+        row = self.state.db.execute('SELECT * FROM inbox').fetchone()
+        self.assertIsNone(row['delivered_at'])
+        self.assertIsNone(row['delivery_pid'])
+        self.assertIsNone(row['delivery_owner'])
+        code, out, err = self.run_hook('PostToolUse')
+        self.assertEqual((code, err), (0, ''))
+        self.assertIn('Read first', out)
+        self.assertNotIn('(re-sent)', out)
 
     def test_tool_delivery_confirms_only_previous_items_on_post_or_stop(self):
         for confirm_event in ('PostToolUse', 'Stop'):
