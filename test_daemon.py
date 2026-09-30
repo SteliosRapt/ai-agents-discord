@@ -112,10 +112,50 @@ class ListenerTests(unittest.TestCase):
         self.assertEqual(body['type'], 4)
         self.assertEqual(body['data']['flags'], 64)
         lines = body['data']['content'].splitlines()
-        self.assertIn(f'`{live["handle"]}` claude · Project · Build · active 2m ago · <#123>', lines)
-        self.assertIn(f'`{idle["handle"]}` codex · Project · no Discord task · active 0m ago', lines)
+        self.assertIn(f'💤 idle `{live["handle"]}` claude · Project · Build · active 2m ago · <#123>', lines)
+        self.assertIn(f'💤 idle `{idle["handle"]}` codex · Project · no Discord task · active 0m ago', lines)
         self.assertEqual(len(lines), 2)
         self.assertNotIn(ended['handle'], body['data']['content'])
+
+    def test_state_prefixes_and_ten_minute_boundary_in_both_commands(self):
+        row = self.session(title='Build', thread='123')
+        now = time.time()
+        cases = [(event, 3600, '⏳ waiting') for event in ('Stop', 'Notification', 'PermissionRequest')]
+        cases += [(event, age, prefix) for event in ('UserPromptSubmit', 'PostToolUse')
+                  for age, prefix in ((0, '⚙️ working'), (599.999, '⚙️ working'),
+                                      (600, '⚙️ working'), (600.001, '💤 idle'))]
+        cases += [(event, 0, '💤 idle') for event in ('SessionStart', 'OtherEvent', None)]
+        payload = interaction('send', 4)
+        payload['data']['options'] = [{'name': 'agent', 'value': '', 'focused': True}]
+        with patch.object(daemon.time, 'time', return_value=now):
+            for event, age, prefix in cases:
+                with self.subTest(event=event, age=age):
+                    self.state.db.execute('UPDATE host_sessions SET last_event=?, last_seen=? WHERE host_session_id=?',
+                                          (event, now - age, row['host_session_id']))
+                    self.calls.clear()
+                    self.listener.handle(interaction(), background=False)
+                    self.assertEqual(self.calls[0][2]['data']['content'],
+                                     f'{prefix} `{row["handle"]}` claude · Project · Build · active {int(age / 60)}m ago · <#123>')
+                    self.calls.clear()
+                    self.listener.handle(payload, background=False)
+                    self.assertEqual(self.calls[0][2]['data']['choices'],
+                                     [{'name': f'{prefix} {row["handle"]} · claude · Project · Build', 'value': row['handle']}])
+
+    def test_agents_order_by_state_then_newest_activity(self):
+        now = time.time()
+        rows = []
+        for name, event, age in [('idle-new', 'SessionStart', 0), ('working-old', 'PostToolUse', 600),
+                                 ('waiting-old', 'Stop', 3600), ('idle-old', 'PostToolUse', 601),
+                                 ('waiting-new', 'PermissionRequest', 900), ('working-new', 'UserPromptSubmit', 1)]:
+            row = self.session(name)
+            self.state.db.execute('UPDATE host_sessions SET last_event=?, last_seen=? WHERE host_session_id=?',
+                                  (event, now - age, name))
+            rows.append(self.state.host_session_by_handle(row['handle']))
+        expected = [rows[index]['handle'] for index in (4, 2, 5, 1, 0, 3)]
+        with patch.object(daemon.time, 'time', return_value=now):
+            self.listener.handle(interaction(), background=False)
+            self.assertEqual(re.findall(r'`([a-z0-9]{4})`', self.calls[0][2]['data']['content']), expected)
+            self.assertEqual(re.findall(r'`([a-z0-9]{4})`', daemon.agents_text(rows)), expected)
 
     def test_agents_truncation_counts_all_omitted_rows(self):
         for index in range(30):
@@ -127,7 +167,24 @@ class ListenerTests(unittest.TestCase):
         match = re.fullmatch(r'…and (\d+) more', lines[-1])
         self.assertIsNotNone(match)
         self.assertEqual(len(lines) - 1 + int(match[1]), 30)
-        self.assertTrue(all(line.startswith('`') for line in lines[:-1]))
+        self.assertTrue(all(line.startswith('💤 idle `') for line in lines[:-1]))
+
+    def test_agents_prefix_counts_toward_exact_limit_and_marker_space(self):
+        row = dict(self.session())
+        now = row['last_seen']
+        template = f'💤 idle `{row["handle"]}` claude · Project · {{}} · active 0m ago'
+        row['title'] = 'x' * (2000 - len(template.format('')))
+        second = dict(row, handle='zzzz', title='Second', last_seen=now - 1)
+        with patch.object(daemon.time, 'time', return_value=now):
+            self.assertEqual(daemon.agents_text([row]), template.format(row['title']))
+            self.assertEqual(len(daemon.agents_text([row])), 2000)
+            self.assertEqual(daemon.agents_text([row, second]), '…and 2 more')
+            row['title'] += 'x'
+            self.assertEqual(daemon.agents_text([row]), '…and 1 more')
+            row['title'] = row['title'][:-(1 + len('\n…and 1 more'))]
+            text = daemon.agents_text([row, second])
+            self.assertEqual(text, template.format(row['title']) + '\n…and 1 more')
+            self.assertEqual(len(text), 2000)
 
     def test_autocomplete_filters_case_insensitively_caps_names_and_count(self):
         for index in range(60):
@@ -140,9 +197,10 @@ class ListenerTests(unittest.TestCase):
         choices = body['data']['choices']
         self.assertEqual(len(choices), 25)
         for choice in choices:
-            self.assertLessEqual(len(choice['name']), 100)
+            self.assertEqual(len(choice['name']), 100)
+            self.assertTrue(choice['name'].startswith('💤 idle '))
             self.assertIn('codex', choice['name'].casefold())
-            self.assertEqual(choice['value'], choice['name'].split(' · ')[0])
+            self.assertEqual(choice['value'], choice['name'].removeprefix('💤 idle ').split(' · ')[0])
             self.assertRegex(choice['value'], r'^[a-z0-9]{4}$')
         self.calls.clear()
         payload['data']['options'][0]['value'] = 'no match anywhere'

@@ -183,14 +183,24 @@ def download(attachment, handle):
 def project(row):
     return Path(row['cwd']).name
 
+def session_state(row, now):
+    if row['last_event'] in ('Stop', 'Notification', 'PermissionRequest'):
+        return 0, '⏳ waiting'
+    if row['last_event'] in ('UserPromptSubmit', 'PostToolUse') and now - row['last_seen'] <= 600:
+        return 1, '⚙️ working'
+    return 2, '💤 idle'
+
 def agents_text(rows):
     if not rows:
         return 'No running Claude Code or Codex sessions with the plugin.'
+    now = time.time()
+    rows = sorted(rows, key=lambda row: (session_state(row, now)[0], -row['last_seen']))
     lines = []
     for index, row in enumerate(rows):
         title = ' '.join((row['title'] or 'no Discord task').splitlines())
-        age = max(0, int((time.time() - row['last_seen']) / 60))
-        line = f'`{row["handle"]}` {row["host"]} · {project(row)} · {title} · active {age}m ago'
+        age = max(0, int((now - row['last_seen']) / 60))
+        prefix = session_state(row, now)[1]
+        line = f'{prefix} `{row["handle"]}` {row["host"]} · {project(row)} · {title} · active {age}m ago'
         if row['thread_id']:
             line += f' · <#{row["thread_id"]}>'
         if len('\n'.join(lines + [line])) <= 2000:
@@ -266,8 +276,10 @@ class Listener:
                 choices = []
                 if data.get('name') == 'send' and focused is not None:
                     with contextlib.closing(agent_state.State()) as state:
+                        now = time.time()
                         for row in state.live_host_sessions():
-                            name = f'{row["handle"]} · {row["host"]} · {project(row)} · {row["title"] or "idle"}'[:100]
+                            prefix = session_state(row, now)[1]
+                            name = f'{prefix} {row["handle"]} · {row["host"]} · {project(row)} · {row["title"] or "idle"}'[:100]
                             if str(focused.get('value', '')).casefold() in name.casefold():
                                 choices.append({'name': name, 'value': row['handle']})
                                 if len(choices) == 25:
