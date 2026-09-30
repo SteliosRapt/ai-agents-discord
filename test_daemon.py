@@ -72,7 +72,7 @@ class ListenerTests(unittest.TestCase):
                     payload = send('aaaa')
                     payload.update(overrides, type=kind)
                     with patch.object(agent_state, 'State') as state:
-                        self.listener.handle(payload)
+                        self.listener.handle(payload, background=False)
                         state.assert_not_called()
                     self.urlopen.assert_not_called()
                     self.assertEqual(len(self.calls), 1)
@@ -90,7 +90,7 @@ class ListenerTests(unittest.TestCase):
     def test_agents_empty_and_user_id_fallback(self):
         payload = interaction(user={'id': '2'})
         del payload['member']
-        self.listener.handle(payload)
+        self.listener.handle(payload, background=False)
         self.assertEqual(self.calls[0][2], {'type': 4, 'data': {'flags': 64,
                          'content': 'No running Claude Code or Codex sessions with the plugin.',
                          'allowed_mentions': {'parse': []}}})
@@ -107,7 +107,7 @@ class ListenerTests(unittest.TestCase):
         self.state.db.execute('UPDATE host_sessions SET last_seen=? WHERE host_session_id=?', (now - 43201, old['host_session_id']))
         self.state.db.execute('UPDATE host_sessions SET host_pid=999 WHERE host_session_id=?', (dead['host_session_id'],))
         with patch.object(daemon.time, 'time', return_value=now), patch.object(agent_state, 'process_alive', return_value=False):
-            self.listener.handle(interaction())
+            self.listener.handle(interaction(), background=False)
         body = self.calls[0][2]
         self.assertEqual(body['type'], 4)
         self.assertEqual(body['data']['flags'], 64)
@@ -120,7 +120,7 @@ class ListenerTests(unittest.TestCase):
     def test_agents_truncation_counts_all_omitted_rows(self):
         for index in range(30):
             self.session(str(index), title='Task ' + 'x' * 200, thread='123')
-        self.listener.handle(interaction())
+        self.listener.handle(interaction(), background=False)
         text = self.calls[0][2]['data']['content']
         self.assertLessEqual(len(text), 2000)
         lines = text.splitlines()
@@ -134,7 +134,7 @@ class ListenerTests(unittest.TestCase):
             self.session(str(index), host='codex' if index % 2 else 'claude', title='Long ' + 'x' * 200)
         payload = interaction('send', 4)
         payload['data']['options'] = [{'name': 'agent', 'value': 'CoDeX', 'focused': True}]
-        self.listener.handle(payload)
+        self.listener.handle(payload, background=False)
         body = self.calls[0][2]
         self.assertEqual(body['type'], 8)
         choices = body['data']['choices']
@@ -146,7 +146,7 @@ class ListenerTests(unittest.TestCase):
             self.assertRegex(choice['value'], r'^[a-z0-9]{4}$')
         self.calls.clear()
         payload['data']['options'][0]['value'] = 'no match anywhere'
-        self.listener.handle(payload)
+        self.listener.handle(payload, background=False)
         self.assertEqual(self.calls[0][2]['data']['choices'], [])
 
     def test_send_defers_downloads_queues_posts_and_edits(self):
@@ -161,7 +161,7 @@ class ListenerTests(unittest.TestCase):
             return io.BytesIO(b'data')
 
         self.urlopen.side_effect = download
-        self.listener.handle(send(row['handle']))
+        self.listener.handle(send(row['handle']), background=False)
         queued = self.inbox()
         self.assertEqual(len(queued), 1)
         self.assertEqual((queued[0]['host_session_id'], queued[0]['note'], queued[0]['sender_id']),
@@ -187,8 +187,8 @@ class ListenerTests(unittest.TestCase):
         fixed = Mock()
         fixed.now.return_value.strftime.return_value = '20260930-120000_'
         with patch.object(daemon, 'datetime', fixed):
-            self.listener.handle(payload)
-            self.listener.handle(payload)
+            self.listener.handle(payload, background=False)
+            self.listener.handle(payload, background=False)
         paths = [Path(r['path']) for r in self.inbox()]
         self.assertEqual([p.name for p in paths], ['20260930-120000__CON.txt', '20260930-120000__CON_1.txt'])
         self.assertEqual([c[0] for c in self.calls], ['POST', 'PATCH', 'POST', 'PATCH'])
@@ -199,7 +199,7 @@ class ListenerTests(unittest.TestCase):
         self.state.touch_host_session('claude', 'host-one', self.root, None, 'SessionEnd')
         for handle in ('xxxx', row['handle']):
             self.calls.clear()
-            self.listener.handle(send(handle))
+            self.listener.handle(send(handle), background=False)
             self.assertEqual(self.calls[0][2]['type'], 5)
             self.assertEqual(self.calls[1][2]['content'], f'Unknown or inactive session `{handle}`. Use /agents.')
         self.urlopen.assert_not_called()
@@ -211,7 +211,7 @@ class ListenerTests(unittest.TestCase):
                     'https://cdn.discordapp.com@evil.example/file', 'https://user:password@cdn.discordapp.com/file'):
             with self.subTest(url=url):
                 self.calls.clear()
-                self.listener.handle(send(row['handle'], url=url))
+                self.listener.handle(send(row['handle'], url=url), background=False)
                 self.assertEqual(self.calls[0][2]['type'], 5)
                 self.assertTrue(self.calls[-1][2]['content'].startswith('Failed: ValueError:'))
                 self.assertEqual(self.inbox(), [])
@@ -228,7 +228,7 @@ class ListenerTests(unittest.TestCase):
             with self.subTest(source=type(source).__name__):
                 self.calls.clear()
                 self.urlopen.side_effect = source if isinstance(source, Exception) else lambda *a, result=source, **k: result
-                self.listener.handle(send(row['handle'], size=size))
+                self.listener.handle(send(row['handle'], size=size), background=False)
                 self.assertTrue(self.calls[-1][2]['content'].startswith('Failed: '))
                 self.assertNotIn(BOT, self.calls[-1][2]['content'])
                 self.assertNotIn(INTERACTION, self.calls[-1][2]['content'])
@@ -241,7 +241,7 @@ class ListenerTests(unittest.TestCase):
     def test_inbox_write_failure_removes_completed_download(self):
         row = self.session()
         with patch.object(agent_state.State, 'add_inbox', side_effect=RuntimeError(INTERACTION)):
-            self.listener.handle(send(row['handle']))
+            self.listener.handle(send(row['handle']), background=False)
         self.assertEqual(self.inbox(), [])
         self.assertEqual(list((self.root / 'inbox' / row['handle']).iterdir()), [])
         self.assertIn('Failed: RuntimeError: [redacted]', self.calls[-1][2]['content'])
@@ -249,7 +249,7 @@ class ListenerTests(unittest.TestCase):
     def test_thread_post_failure_is_reported_and_preserves_queued_file(self):
         row = self.session(thread='123')
         with patch.object(self.client, 'send_message', side_effect=RuntimeError(BOT + ' ' + INTERACTION)):
-            self.listener.handle(send(row['handle']))
+            self.listener.handle(send(row['handle']), background=False)
         self.assertEqual(len(self.inbox()), 1)
         self.assertTrue(Path(self.inbox()[0]['path']).is_file())
         self.assertTrue(self.calls[-1][2]['content'].startswith('Failed: RuntimeError:'))
@@ -282,18 +282,142 @@ class ListenerTests(unittest.TestCase):
             self.listener.close()
         self.assertEqual(len(self.inbox()), 1)
 
+    def test_busy_download_pool_does_not_delay_acknowledgements_and_caps_admission(self):
+        row = self.session()
+        release = threading.Event()
+        entered = threading.Barrier(5)
+        caller = threading.get_ident()
+        callback_threads = []
+        original = self.request.side_effect
+
+        def request(method, path, payload=None, **kwargs):
+            if method == 'POST':
+                callback_threads.append(threading.get_ident())
+            return original(method, path, payload, **kwargs)
+
+        def blocked(*args, **kwargs):
+            entered.wait(timeout=3)
+            if not release.wait(5):
+                raise TimeoutError('test download remained blocked')
+            return io.BytesIO(b'data')
+
+        self.request.side_effect = request
+        self.urlopen.side_effect = blocked
+        try:
+            for _ in range(4):
+                self.listener.on_dispatch('INTERACTION_CREATE', send(row['handle']))
+            entered.wait(timeout=3)
+            start = len(self.calls)
+            self.listener.on_dispatch('INTERACTION_CREATE', interaction())
+            autocomplete = interaction('send', 4)
+            autocomplete['data']['options'] = [{'name': 'agent', 'focused': True, 'value': ''}]
+            self.listener.on_dispatch('INTERACTION_CREATE', autocomplete)
+            for _ in range(4):
+                self.listener.on_dispatch('INTERACTION_CREATE', send(row['handle']))
+            self.listener.on_dispatch('INTERACTION_CREATE', send(row['handle']))
+            bodies = [call[2] for call in self.calls[start:]]
+            self.assertEqual([body['type'] for body in bodies], [4, 8, 5, 5, 5, 5, 4])
+            self.assertEqual(bodies[-1]['data']['content'], 'Busy, try again shortly')
+            self.assertEqual(bodies[-1]['data']['flags'], 64)
+            self.assertEqual(callback_threads, [caller] * 11)
+        finally:
+            # Queued downloads should finish without waiting on the initial barrier.
+            self.urlopen.side_effect = lambda *a, **k: io.BytesIO(b'data')
+            release.set()
+            self.listener.pool.shutdown(wait=True)
+            self.listener.close()
+        self.assertEqual(len(self.inbox()), 8)
+
+    def test_session_ends_or_process_dies_during_download_is_not_queued(self):
+        for death in ('ended', 'dead pid'):
+            with self.subTest(death=death):
+                row = self.session(death, thread='123')
+                def downloaded(*args, **kwargs):
+                    if death == 'ended':
+                        self.state.touch_host_session('claude', death, self.root, None, 'SessionEnd')
+                    else:
+                        self.state.db.execute('UPDATE host_sessions SET host_pid=999 WHERE host_session_id=?', (death,))
+                    return io.BytesIO(b'data')
+                self.urlopen.side_effect = downloaded
+                with patch.object(agent_state, 'process_alive', return_value=False):
+                    self.listener.handle(send(row['handle']), background=False)
+                self.assertEqual(self.inbox(), [])
+                self.assertEqual(list((self.root / 'inbox' / row['handle']).iterdir()), [])
+                self.assertEqual(self.calls[-1][2]['content'],
+                                 f'Session `{row["handle"]}` ended during the download; file not queued.')
+                self.assertFalse(any(call[1] == '/channels/123/messages' for call in self.calls))
+
+    def test_liveness_recheck_and_insert_share_immediate_transaction(self):
+        row = self.session()
+        self.state.db.execute('UPDATE host_sessions SET host_pid=999')
+        statements = []
+        original = agent_state.State.add_inbox
+        worker_state = []
+        factory = agent_state.State
+
+        def open_state():
+            state = factory()
+            state.db.set_trace_callback(statements.append)
+            worker_state.append(state)
+            return state
+
+        def alive(pid):
+            self.assertEqual(pid, 999)
+            # The first lookup precedes the download; the second must hold the transaction.
+            if len(checks) == 1:
+                self.assertTrue(worker_state[0].db.in_transaction)
+            checks.append(pid)
+            return True
+
+        def insert(state, *args):
+            self.assertTrue(state.db.in_transaction)
+            return original(state, *args)
+
+        checks = []
+        with patch.object(agent_state, 'process_alive', side_effect=alive), \
+                patch.object(agent_state.State, 'add_inbox', autospec=True, side_effect=insert), \
+                patch.object(agent_state, 'State', side_effect=open_state):
+            self.listener.handle(send(row['handle']), background=False)
+        self.assertEqual(checks, [999, 999])
+        begin = statements.index('BEGIN IMMEDIATE')
+        self.assertTrue(statements[begin + 1].startswith('SELECT * FROM host_sessions WHERE host_session_id='))
+        self.assertTrue(statements[begin + 2].startswith('INSERT INTO inbox '))
+        self.assertEqual(statements[begin + 3], 'COMMIT')
+        self.assertEqual(len(self.inbox()), 1)
+
+    def test_admission_released_after_callback_or_submission_failure(self):
+        row = self.session()
+        for failure in ('callback', 'submission'):
+            with self.subTest(failure=failure):
+                if failure == 'callback':
+                    context = patch.object(self.client, 'request', side_effect=RuntimeError(INTERACTION))
+                else:
+                    context = patch.object(self.listener.pool, 'submit', side_effect=RuntimeError(INTERACTION))
+                with context:
+                    self.listener.on_dispatch('INTERACTION_CREATE', send(row['handle']))
+                # All eight slots must remain available after an unsubmitted download.
+                acquired = []
+                try:
+                    for _ in range(8):
+                        acquired.append(self.listener.download_slots.acquire(blocking=False))
+                    self.assertEqual(acquired, [True] * 8)
+                finally:
+                    for success in acquired:
+                        if success:
+                            self.listener.download_slots.release()
+
     def test_autocomplete_state_failure_uses_empty_autocomplete_and_logs_error(self):
         payload = interaction('send', 4)
         payload['data']['options'] = [{'name': 'agent', 'value': '', 'focused': True}]
         with patch.object(agent_state, 'State', side_effect=RuntimeError(INTERACTION)):
-            self.listener.handle(payload)
+            self.listener.handle(payload, background=False)
         self.assertEqual(self.calls[0][2]['type'], 8)
         self.assertEqual(self.calls[0][2]['data']['choices'], [])
         self.assertIn('RuntimeError: [redacted]', self.logger.path.read_text(encoding='utf-8'))
 
     def test_callback_failure_is_logged_without_reposting_or_exposing_tokens(self):
         self.request.side_effect = RuntimeError(BOT + ' ' + INTERACTION)
-        self.listener.handle(interaction())
+        self.listener.handle(interaction(), background=False)
         self.request.assert_called_once()
         text = self.logger.path.read_text(encoding='utf-8')
         self.assertIn('Failed: RuntimeError:', text)
@@ -305,7 +429,7 @@ class ListenerTests(unittest.TestCase):
             self.listener.on_dispatch('INTERACTION_CREATE', interaction())
             self.listener.close()
         text = self.logger.path.read_text(encoding='utf-8')
-        self.assertIn('Interaction worker failed: RuntimeError:', text)
+        self.assertIn('Interaction dispatch failed: RuntimeError:', text)
         self.assertNotIn(BOT, text)
         self.assertNotIn(INTERACTION, text)
 

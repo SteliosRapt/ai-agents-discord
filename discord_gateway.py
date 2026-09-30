@@ -249,14 +249,19 @@ class Gateway:
         ws = WebSocket.connect(url, timeout=10)
         done = threading.Event()
         lock = threading.Lock()
-        state = {'deadline': None, 'awaiting_ack': False, 'error': None}
+        hello_lock = threading.Lock()
+        state = {'deadline': None, 'unacked_since': None, 'error': None,
+                 'hello_deadline': time.monotonic() + 30}
 
         def send_heartbeat(check_ack=False):
             with lock:
-                if check_ack and state['awaiting_ack']:
+                now = time.monotonic()
+                if (check_ack and state['unacked_since'] is not None and
+                        now - state['unacked_since'] >= interval):
                     raise ConnectionError('Gateway heartbeat ACK missing; reconnecting')
                 ws.send_text(json.dumps({'op': 1, 'd': self.last_seq}))
-                state['awaiting_ack'] = True
+                if state['unacked_since'] is None:
+                    state['unacked_since'] = now
 
         def heartbeat_loop():
             while not done.wait(0.05):
@@ -268,7 +273,8 @@ class Gateway:
                     try:
                         send_heartbeat(True)
                         with lock:
-                            state['deadline'] = time.monotonic() + interval
+                            since = state['unacked_since']
+                            state['deadline'] = (since if since is not None else time.monotonic()) + interval
                     except Exception as exc:
                         state['error'] = exc
                         ws.close(4000)
@@ -280,13 +286,33 @@ class Gateway:
                 if stop_event.is_set():
                     ws.close(1000)
                     return
+                # Do not wait for the heartbeat lock: a blocked write must not stall shutdown.
+                with hello_lock:
+                    deadline = state['hello_deadline']
+                    expired = deadline is not None and time.monotonic() >= deadline
+                    if expired:
+                        state['error'] = TimeoutError('Gateway HELLO timed out after 30 seconds')
+                if expired:
+                    ws.close(4000)
+                    return
 
         thread = threading.Thread(target=heartbeat_loop, name='discord-heartbeat', daemon=True)
         stop_thread = threading.Thread(target=watch_stop, name='discord-stop', daemon=True)
         thread.start()
         stop_thread.start()
         try:
-            hello = json.loads(ws.recv())
+            try:
+                hello = json.loads(ws.recv())
+            except Exception:
+                if state['error'] is not None:
+                    raise state['error'] from None
+                raise
+            with hello_lock:
+                if time.monotonic() >= state['hello_deadline']:
+                    raise TimeoutError('Gateway HELLO timed out after 30 seconds')
+                state['hello_deadline'] = None
+                if state['error'] is not None:
+                    raise state['error']
             if hello.get('op') != 10:
                 raise ValueError('Gateway expected HELLO')
             interval = hello['d']['heartbeat_interval'] / 1000
@@ -323,7 +349,7 @@ class Gateway:
                         self._log_error(exc)
                 elif op == 11:
                     with lock:
-                        state['awaiting_ack'] = False
+                        state['unacked_since'] = None
                 elif op == 1:
                     send_heartbeat()
                 elif op == 7:
