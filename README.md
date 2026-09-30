@@ -110,6 +110,13 @@ Both keys are optional in `config.toml`.
   - The listener connected to the real Gateway (READY) and registered `/agents` and `/send`.
   - A fresh Claude session ran the hooks: SessionStart registered it, UserPromptSubmit took the queued inbox item, SessionEnd closed it.
   - Codex 0.2.0 install and MCP tools work; its hooks await your `/hooks` trust.
+- **Phase 4, 2026-10-01:** an independent Codex security + reliability review found 17 defects; all are fixed, each with a regression test.
+  - Three further races surfaced while verifying the fixes and were fixed too: the answer window with concurrent questions, and two same-name `/send` download races.
+  - Live:
+    - the listener reconnected and resumed on its own overnight
+    - the hook stores a Greek/emoji working folder correctly
+    - Codex 0.4.0 installed
+- **Trust assumption:** `%USERPROFILE%\.ai-agents` and its parent folders are not writable by anyone else.
 - **Not yet tested live:**
   - `/agents` and `/send` issued from Discord (needs the owner)
   - Phase 3 alerts and `run_and_notify` live status (not posted overnight so your phone stays quiet; offline tests cover payloads and mentions)
