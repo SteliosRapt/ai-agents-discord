@@ -221,9 +221,12 @@ class AgentSession:
             question = self.state.db.execute('SELECT * FROM questions WHERE id=? AND session_id=?', (question_id, self.id)).fetchone()
             if not question:
                 raise ValueError('Question does not belong to this session')
-            later = [int(q[0]) for q in self.state.db.execute('SELECT id FROM questions WHERE session_id=?', (self.id,)) if int(q[0]) > int(question_id)]
-            end = min(later) if later else None
         while True:
+            # Recomputed on every poll: ask_owner can run concurrently (async tools) and a newer question
+            # ends this question's answer window.
+            with self.lock:
+                later = [int(q[0]) for q in self.state.db.execute('SELECT id FROM questions WHERE session_id=?', (self.id,)) if int(q[0]) > int(question_id)]
+            end = min(later) if later else None
             messages, cursor = [], question_id
             while True:
                 page = self.client.get_messages(row['thread_id'], after=cursor)

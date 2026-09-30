@@ -538,6 +538,16 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(self.session.check_answer(first)['answered'])
         self.assertEqual(self.session.check_answer(second)['answer']['messages'][0]['content'], 'for second')
 
+    def test_answer_window_tracks_question_asked_during_wait(self):
+        self.start()
+        first = self.session.ask_owner('First?')['question_id']
+        def ask_while_waiting(seconds):
+            # A concurrent ask_owner lands between polls, then the owner answers that newer question.
+            second = self.session.ask_owner('Second?')['question_id']
+            self.http.history = [message(int(second) + 1, '2', None, 'for second')]
+        with patch.object(agents.time, 'monotonic', side_effect=[0, 0, 10]), patch.object(agents.time, 'sleep', side_effect=ask_while_waiting):
+            self.assertFalse(self.session.check_answer(first, 10)['answered'])
+
     def test_answer_poll_interval(self):
         self.start()
         question_id = self.session.ask_owner('Question?')['question_id']
