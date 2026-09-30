@@ -82,6 +82,21 @@ py ai_agents_daemon.py uninstall-autostart
 - Sessions appear after they start with the hooks installed; sessions already open need a restart.
 - **Codex skips plugin hooks until you trust them once in Codex's `/hooks` review.** Until then Codex sessions don't appear in `/agents` and can't receive `/send`, although their MCP tools work.
 
+### Automatic alerts (no model tokens)
+Alerts only fire for sessions whose agent opened a Discord thread with `start_session`. They're posted into that thread by the hook:
+- **Claude asks for a permission, or Codex waits for an approval:** "⏳ Needs your attention …"
+- **A turn ran at least `long_turn_minutes` (default 10):** "✅ Turn finished after N min: <last reply, 300 chars>"
+- Claude's "waiting for your input" idle reminders are ignored, since the turn-finished alert covers them.
+- With `alert_mentions_owner = true` (the default), alerts ping **only you** (`<@you>`, never roles or @everyone), so the phone notifies even for threads you don't follow.
+
+Both keys are optional in `config.toml`.
+
+### Live job status (webhook)
+`py run_and_notify.py --name "Render shot 12" --every 60 -- blender -b scene.blend -a`
+- Posts "▶ started", then edits that one message every `--every` seconds (at least 15) with the elapsed time and last output line. Edits don't buzz the phone.
+- At the end it edits the message and posts a new ✅/❌ message, which does notify. A failure attaches the last 60 log lines.
+- The full log goes to `%USERPROFILE%\.ai-agents\jobs\`, or to `--log`. The script exits with the command's exit code.
+
 ### Tested
 - **Offline:** `py test_toolkit.py`, `py test_agents.py`.
 - **Live, 2026-09-30:** one end-to-end run through the stdio MCP server against the real server:
@@ -97,6 +112,7 @@ py ai_agents_daemon.py uninstall-autostart
   - Codex 0.2.0 install and MCP tools work; its hooks await your `/hooks` trust.
 - **Not yet tested live:**
   - `/agents` and `/send` issued from Discord (needs the owner)
+  - Phase 3 alerts and `run_and_notify` live status (not posted overnight so your phone stays quiet; offline tests cover payloads and mentions)
   - the model's reply to an injected inbox item (the standalone `claude` CLI login had expired)
   - `send_video` transcoding
   - a full posting session started by a real Claude or Codex agent (as opposed to the scripted MCP client)
