@@ -147,7 +147,7 @@ class AgentSession:
             row = self.active()
             check_content(text)
             paths = self.files(files)
-            return posted(self.client.send_message(row['thread_id'], text, paths))
+            return posted(self.client.send_message(row['thread_id'], text, paths, cancelled=CALL_CANCELLED.get()))
 
     def update_status(self, text: str) -> dict:
         """Maintain one status message, creating it first and editing it thereafter."""
@@ -181,7 +181,7 @@ class AgentSession:
                     raise TooLarge('File exceeds configured upload budget')
                 if cancelled is not None and cancelled.is_set():
                     raise RuntimeError('Video send cancelled before upload')
-                return self.client.send_message(row['thread_id'], message, [file])
+                return self.client.send_message(row['thread_id'], message, [file], cancelled=cancelled)
             return posted(deliver_video(source, text, sender))
 
     def ask_owner(self, question: str) -> dict:

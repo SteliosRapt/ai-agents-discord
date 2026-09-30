@@ -504,6 +504,31 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(any('cancelled' in error.lower() for error in worker_errors))
         self.assertEqual(source.read_bytes(), b'original')
 
+    def test_attachment_cancellation_during_rate_limit_backoff_prevents_retry(self):
+        self.start()
+        source = self.uploads / 'video.mp4'
+        source.write_bytes(b'original')
+        for tool in ('send_video', 'post_milestone'):
+            with self.subTest(tool=tool):
+                cancelled = threading.Event()
+                token = agents.CALL_CANCELLED.set(cancelled)
+                rate_error = urllib.error.HTTPError('offline', 429, '', {}, io.BytesIO(b'{"retry_after":0.25}'))
+                try:
+                    with patch.object(bot.urllib.request, 'urlopen', side_effect=[rate_error, io.BytesIO(b'{"id":"ok"}')]) as http, \
+                            patch.object(bot.time, 'sleep', side_effect=lambda delay: cancelled.set()) as sleep:
+                        with self.assertRaisesRegex(RuntimeError, 'cancelled'):
+                            if tool == 'send_video':
+                                self.session.send_video(str(source), 'video')
+                            else:
+                                self.session.post_milestone('milestone', [str(source)])
+                        http.assert_called_once()
+                        self.assertEqual(http.call_args.args[0].get_method(), 'POST')
+                        self.assertIn(b'name="files[0]"', http.call_args.args[0].data)
+                        sleep.assert_called_once_with(.25)
+                finally:
+                    agents.CALL_CANCELLED.reset(token)
+        self.assertEqual(source.read_bytes(), b'original')
+
     def test_answer_window_ends_at_next_question(self):
         self.start()
         first = self.session.ask_owner('First?')['question_id']
@@ -746,6 +771,31 @@ class ClientTests(unittest.TestCase):
                 self.client.send_message('1', 'x')
             self.assertEqual(http.call_count, 5)
             self.assertEqual(sleep.call_count, 4)
+
+    def test_cancellation_is_checked_before_first_http_attempt(self):
+        for kind in ('event', 'callable'):
+            for users in ((), ('2',)):
+                with self.subTest(kind=kind, users=users):
+                    event = threading.Event()
+                    event.set()
+                    cancelled = event if kind == 'event' else event.is_set
+                    with patch.object(bot.urllib.request, 'urlopen') as http:
+                        with self.assertRaisesRegex(RuntimeError, 'cancelled'):
+                            self.client.send_message('1', 'x', mention_users=users, cancelled=cancelled)
+                        http.assert_not_called()
+
+    def test_request_cancellation_during_rate_limit_backoff_prevents_retry(self):
+        for kind in ('event', 'callable'):
+            with self.subTest(kind=kind):
+                event = threading.Event()
+                cancelled = event if kind == 'event' else event.is_set
+                rate_error = urllib.error.HTTPError('offline', 429, '', {}, io.BytesIO(b'{"retry_after":0.25}'))
+                with patch.object(bot.urllib.request, 'urlopen', side_effect=[rate_error, io.BytesIO(b'{"id":"ok"}')]) as http, \
+                        patch.object(bot.time, 'sleep', side_effect=lambda delay: event.set()) as sleep:
+                    with self.assertRaisesRegex(RuntimeError, 'cancelled'):
+                        self.client.request('POST', '/channels/1/messages', {'content': 'x'}, cancelled=cancelled)
+                    http.assert_called_once()
+                    sleep.assert_called_once_with(.25)
 
     def test_doctor_offline(self):
         with tempfile.TemporaryDirectory() as d:

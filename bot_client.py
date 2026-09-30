@@ -46,8 +46,8 @@ class BotClient:
     def __init__(self, guild_id):
         self.guild_id = snowflake(guild_id)
 
-    def request(self, method, path, payload=None, files=(), *, mentions=True):
-        """Make one REST request, retrying only explicit rate limits."""
+    def request(self, method, path, payload=None, files=(), *, mentions=True, cancelled=None):
+        """Retry explicit rate limits, checking an optional Event/callable before every attempt."""
         if payload is not None and mentions:
             payload = dict(payload)
             if 'content' in payload:
@@ -65,6 +65,8 @@ class BotClient:
         headers = {'Authorization': 'Bot ' + token, 'User-Agent': 'DiscordBot (local ai-agents, 1.0)', 'Content-Type': kind}
         req = urllib.request.Request(API + path, data=body, headers=headers, method=method)
         for attempt in range(5):
+            if cancelled is not None and (cancelled() if callable(cancelled) else cancelled.is_set()):
+                raise RuntimeError('Discord request cancelled before HTTP attempt')
             try:
                 with urllib.request.urlopen(req, timeout=55) as response:
                     raw = response.read()
@@ -110,7 +112,7 @@ class BotClient:
     def create_text_channel(self, name, parent_id):
         return self.request('POST', f'/guilds/{self.guild_id}/channels', {'name': name, 'type': 0, 'parent_id': snowflake(parent_id)})
 
-    def send_message(self, channel_id, content, files=(), reply_to=None, *, mention_users=()):
+    def send_message(self, channel_id, content, files=(), reply_to=None, *, mention_users=(), cancelled=None):
         check_content(content)
         payload = {'content': content}
         if reply_to is not None:
@@ -118,8 +120,8 @@ class BotClient:
         users = [snowflake(user) for user in mention_users]
         if users:
             payload['allowed_mentions'] = {'parse': [], 'users': users}
-            return self.request('POST', f'/channels/{snowflake(channel_id)}/messages', payload, files, mentions=False)
-        return self.request('POST', f'/channels/{snowflake(channel_id)}/messages', payload, files)
+            return self.request('POST', f'/channels/{snowflake(channel_id)}/messages', payload, files, mentions=False, cancelled=cancelled)
+        return self.request('POST', f'/channels/{snowflake(channel_id)}/messages', payload, files, cancelled=cancelled)
 
     def edit_message(self, channel_id, message_id, content):
         check_content(content)
