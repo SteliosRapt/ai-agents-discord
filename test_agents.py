@@ -1,6 +1,8 @@
 """Offline acceptance tests; all Discord HTTP is mocked."""
 import contextlib
 import ctypes
+from http.client import HTTPException, BadStatusLine
+import inspect
 import io
 import json
 import os
@@ -24,8 +26,7 @@ TOOLS = {'start_session', 'post_milestone', 'update_status', 'send_video', 'ask_
 
 def write_config(root, **overrides):
     config = {'guild_id': '1', 'owner_user_id': '2', 'agents_category_id': '3',
-              'upload_roots': [str(root / 'uploads')], 'max_messages_per_session': 5,
-              'max_channels_per_day': 2, 'read_channel_ids': ['4']}
+              'upload_roots': [str(root / 'uploads')], 'read_channel_ids': ['4']}
     config.update(overrides)
     (root / 'config.toml').write_text('\n'.join(f'{k} = {json.dumps(v)}' for k, v in config.items()), encoding='utf-8')
 
@@ -88,8 +89,8 @@ class SessionTests(unittest.TestCase):
         self.server, self.session = agents.create_server('codex', self.root)
         self.addCleanup(self.session.close)
 
-    def start(self, budget=3, session=None, project=None):
-        return (session or self.session).start_session('Work title', 'Post milestones and one final summary', budget, str(project or self.project))
+    def start(self, session=None, project=None):
+        return (session or self.session).start_session('Work title', 'Post milestones and one final summary', str(project or self.project))
 
     def assert_no_http(self, action, exception=Exception):
         before = self.urlopen.call_count
@@ -105,6 +106,9 @@ class SessionTests(unittest.TestCase):
         self.assertIsNone(row['project_dir'])
         self.assertEqual(self.session.state.db.execute('PRAGMA journal_mode').fetchone()[0], 'wal')
         self.assertEqual(self.session.state.db.execute('PRAGMA busy_timeout').fetchone()[0], 30000)
+        columns = {r['name'] for r in self.session.state.db.execute('PRAGMA table_info(sessions)')}
+        self.assertEqual(columns, {'id', 'host', 'pid', 'ppid', 'cwd', 'project_dir', 'started_at', 'last_seen',
+                                   'status', 'title', 'plan', 'channel_id', 'thread_id', 'status_message_id'})
         session_id = self.session.id
         self.session.close()
         state = agent_state.State(self.root)
@@ -118,11 +122,10 @@ class SessionTests(unittest.TestCase):
             self.assert_no_http(action, RuntimeError)
 
     def test_start_validation_and_required_host(self):
-        self.assert_no_http(lambda: self.session.start_session('title', '  ', 1, str(self.project)), ValueError)
-        for budget in (0, 6, True):
-            self.assert_no_http(lambda: self.start(budget), ValueError)
+        self.assertEqual(list(inspect.signature(self.session.start_session).parameters), ['title', 'plan', 'project_dir'])
+        self.assert_no_http(lambda: self.session.start_session('title', '  ', str(self.project)), ValueError)
         for project in ('relative', str(self.root / 'missing'), str(self.root / 'config.toml')):
-            self.assert_no_http(lambda: self.session.start_session('title', 'plan', 1, project), ValueError)
+            self.assert_no_http(lambda: self.session.start_session('title', 'plan', project), ValueError)
         with patch('sys.argv', ['ai_agents_mcp.py']), contextlib.redirect_stderr(io.StringIO()) as err:
             with self.assertRaises(SystemExit) as exc:
                 agents.main()
@@ -144,7 +147,6 @@ class SessionTests(unittest.TestCase):
         row = self.session.state.session(self.session.id)
         self.assertEqual(row['project_dir'], str(self.project.resolve()))
         self.assertEqual(row['cwd'], str(Path.cwd()))
-        self.assertEqual(row['messages_used'], 0)
         threads = [c for c in self.http.calls if c[1].endswith('/threads')]
         self.assertEqual(threads[0][2]['name'], 'Work title')
         self.assertEqual(threads[0][2]['auto_archive_duration'], 10080)
@@ -152,24 +154,34 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(posts[:2], ['codex · Work title', 'Post milestones and one final summary'])
         self.assert_no_http(lambda: self.start(), RuntimeError)
 
-    def test_daily_quota(self):
-        write_config(self.root, max_channels_per_day=1)
-        self.session.config['max_channels_per_day'] = 1
-        self.start()
-        other_project = self.root / 'other'
-        other_project.mkdir()
-        _, second = agents.create_server('claude', self.root)
-        self.addCleanup(second.close)
-        self.assert_no_http(lambda: self.start(session=second, project=other_project), RuntimeError)
+    def test_several_project_channels_on_one_day(self):
+        now = agent_state.time.time()
+        with patch.object(agent_state.time, 'time', return_value=now):
+            for index in range(4):
+                project = self.root / f'project-{index}'
+                project.mkdir()
+                _, session = agents.create_server('claude', self.root)
+                self.addCleanup(session.close)
+                self.start(session=session, project=project)
+        creations = [c for c in self.http.calls if c[0] == 'POST' and c[1] == '/guilds/1/channels']
+        self.assertEqual(len(creations), 4)
+        rows = self.session.state.db.execute('SELECT created_at FROM project_channels').fetchall()
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(row['created_at'] == now for row in rows))
 
-    def test_budget_and_final_once(self):
-        self.start(2)
+    def test_25_milestones_without_usage_cap(self):
+        self.start()
+        before = self.urlopen.call_count
+        for index in range(25):
+            self.session.post_milestone(f'Milestone {index}')
+        self.assertEqual(self.urlopen.call_count, before + 25)
+        thread = self.session.state.session(self.session.id)['thread_id']
+        self.assertTrue(all(c[0] == 'POST' and c[1] == f'/channels/{thread}/messages' for c in self.http.calls[-25:]))
+
+    def test_final_once(self):
+        self.start()
         self.session.post_milestone('one')
         self.session.ask_owner('two?')
-        self.assertEqual(self.session.state.session(self.session.id)['messages_used'], 2)
-        for action in (lambda: self.session.post_milestone('three'), lambda: self.session.ask_owner('more?'),
-                       lambda: self.session.update_status('new status')):
-            self.assert_no_http(action, RuntimeError)
         before = self.urlopen.call_count
         self.session.end_session('finished')
         self.assertEqual(self.urlopen.call_count, before + 1)
@@ -177,14 +189,12 @@ class SessionTests(unittest.TestCase):
         self.assert_no_http(lambda: self.session.end_session('again'), RuntimeError)
         self.assert_no_http(lambda: self.session.post_milestone('late'), RuntimeError)
 
-    def test_failed_delivery_keeps_reservation_and_final_is_not_repeated(self):
-        self.start(1)
+    def test_failed_delivery_is_not_retried_and_final_is_not_repeated(self):
+        self.start()
         with patch.object(bot.urllib.request, 'urlopen', side_effect=urllib.error.URLError(TOKEN)) as http:
             with self.assertRaisesRegex(RuntimeError, 'delivery uncertain'):
                 self.session.post_milestone('uncertain')
             http.assert_called_once()
-            with self.assertRaisesRegex(RuntimeError, 'budget exhausted'):
-                self.session.post_milestone('duplicate')
             with self.assertRaisesRegex(RuntimeError, 'delivery uncertain'):
                 self.session.end_session('final')
             with self.assertRaises(RuntimeError):
@@ -201,28 +211,53 @@ class SessionTests(unittest.TestCase):
             self.assert_no_http(lambda: self.session.post_milestone('file', [str(path)]), ValueError)
             self.assert_no_http(lambda: self.session.send_video(str(path), 'video'), ValueError)
         self.assert_no_http(lambda: self.session.post_milestone('many', [str(allowed)] * 11), ValueError)
-        self.assertEqual(self.session.state.session(self.session.id)['messages_used'], 0)
         self.session.post_milestone('allowed', [str(allowed)])
         request = self.http.calls[-1][3]
         self.assertIn(b'name="files[0]"', request.data)
         self.assertIn(b'allowed', request.data)
 
-    def test_status_creation_edit_and_throttle(self):
-        self.start(1)
-        with patch.object(agents.time, 'monotonic', return_value=100):
-            first = self.session.update_status('working')
-            self.assert_no_http(lambda: self.session.update_status('too soon'), RuntimeError)
-        with patch.object(agents.time, 'monotonic', return_value=115):
-            self.session.update_status('progress')
+    def test_toolkit_and_credentials_blocked_even_inside_upload_roots(self):
+        self.start()
+        toolkit = Path(agents.__file__).resolve().parent
+        self.session.config['upload_roots'] = [toolkit.parent, self.uploads]
+        blocked = [toolkit / 'config.toml', toolkit / 'config.example.toml', toolkit / 'nested' / 'asset.txt']
+        for name in ('secret.dpapi', 'secret.DPAPI'):
+            path = self.uploads / name
+            path.write_bytes(b'encrypted-test-value')
+            blocked.append(path)
+        for path in blocked:
+            with self.subTest(path=path):
+                self.assert_no_http(lambda: self.session.post_milestone('blocked', [str(path)]), ValueError)
+                self.assert_no_http(lambda: self.session.send_video(str(path), 'blocked'), ValueError)
+
+    def test_compressed_copies_pass_the_same_upload_checks(self):
+        self.start()
+        source = self.uploads / 'video.mp4'
+        source.write_bytes(b'original')
+        toolkit = Path(agents.__file__).resolve().parent
+        credential = self.uploads / 'compressed.DPAPI'
+        credential.write_bytes(b'encrypted-test-value')
+        self.session.config['upload_roots'] = [toolkit.parent, self.uploads]
+        for blocked in (toolkit / 'compressed.mp4', credential):
+            def deliver(video, text, sender):
+                return sender(text, blocked, 20)
+            with patch.object(agents, 'deliver_video', side_effect=deliver):
+                self.assert_no_http(lambda: self.session.send_video(str(source), 'copy'), ValueError)
+        self.assertEqual(source.read_bytes(), b'original')
+
+    def test_status_creation_and_immediate_edit(self):
+        self.start()
+        before = self.urlopen.call_count
+        first = self.session.update_status('working')
+        self.session.update_status('progress')
+        self.assertEqual(self.urlopen.call_count, before + 2)
+        self.assertEqual(self.http.calls[-2][0], 'POST')
         self.assertEqual(self.session.state.session(self.session.id)['status_message_id'], first['id'])
-        self.assertEqual(self.session.state.session(self.session.id)['messages_used'], 1)
         self.assertEqual(self.http.calls[-1][0], 'PATCH')
         self.assertIn(first['id'], self.http.calls[-1][1])
-        with patch.object(agents.time, 'monotonic', return_value=129):
-            self.assert_no_http(lambda: self.session.update_status('soon again'), RuntimeError)
 
     def test_video_bot_tiers_preserve_original(self):
-        self.start(1)
+        self.start()
         source = self.uploads / 'video.mp4'
         source.write_bytes(b'original')
         def reject_first(request, **kwargs):
@@ -240,8 +275,6 @@ class SessionTests(unittest.TestCase):
         self.assertIn(b'720p', self.http.calls[-1][3].data)
         self.assertIn(self.session.state.session(self.session.id)['thread_id'], self.http.calls[-1][1])
         self.assertEqual(self.urlopen.call_count, before + 2)
-        self.assertEqual(self.session.state.session(self.session.id)['messages_used'], 1)
-        self.assert_no_http(lambda: self.session.send_video(str(source), 'Over budget'), RuntimeError)
 
     def test_owner_answers_only_direct_replies(self):
         self.start()
@@ -290,7 +323,7 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.session.list_channels(), [{'id': '100', 'name': 'own', 'type': 0}, {'id': '4', 'name': 'allowed', 'type': 0}])
 
     def test_content_rejected_before_http(self):
-        self.assert_no_http(lambda: self.session.start_session('x' * 2001, 'plan', 1, str(self.project)), ValueError)
+        self.assert_no_http(lambda: self.session.start_session('x' * 2001, 'plan', str(self.project)), ValueError)
         self.start()
         for action in (lambda: self.session.post_milestone('x' * 2001), lambda: self.session.ask_owner('x' * 2001),
                        lambda: self.session.update_status('x' * 2001), lambda: self.session.end_session('x' * 2001)):
@@ -302,12 +335,13 @@ class SessionTests(unittest.TestCase):
                 tools = (await client.list_tools()).tools
                 self.assertEqual({tool.name for tool in tools}, TOOLS)
                 start = next(tool for tool in tools if tool.name == 'start_session')
-                self.assertIn('project_dir', start.inputSchema['required'])
+                self.assertEqual(set(start.inputSchema['properties']), {'title', 'plan', 'project_dir'})
+                self.assertEqual(set(start.inputSchema['required']), {'title', 'plan', 'project_dir'})
                 before = self.urlopen.call_count
                 failed = await client.call_tool('post_milestone', {'text': 'before start'})
                 self.assertTrue(failed.isError)
                 self.assertEqual(self.urlopen.call_count, before)
-                started = await client.call_tool('start_session', {'title': 'SDK', 'plan': 'Post after checks', 'max_messages': 1, 'project_dir': str(self.project)})
+                started = await client.call_tool('start_session', {'title': 'SDK', 'plan': 'Post after checks', 'project_dir': str(self.project)})
                 self.assertFalse(started.isError)
                 posted = await client.call_tool('post_milestone', {'text': 'SDK milestone'})
                 self.assertFalse(posted.isError)
@@ -367,6 +401,28 @@ class ClientTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'network request failed'):
                 self.client.get_channel('1')
 
+    def test_raw_network_errors_during_open_and_read(self):
+        for method in ('POST', 'PATCH', 'GET'):
+            expected = 'Discord network request failed' if method == 'GET' else 'delivery uncertain'
+            for stage in ('open', 'read', 'error_read'):
+                for error_type in (TimeoutError, OSError, HTTPException, BadStatusLine):
+                    with self.subTest(method=method, stage=stage, error_type=error_type):
+                        error = error_type(TOKEN)
+                        response = Mock()
+                        response.read.side_effect = error
+                        if stage == 'open':
+                            kwargs = {'side_effect': error}
+                        elif stage == 'read':
+                            kwargs = {'return_value': contextlib.nullcontext(response)}
+                        else:
+                            kwargs = {'side_effect': urllib.error.HTTPError('offline', 429, TOKEN, {}, response)}
+                        with patch.object(bot.urllib.request, 'urlopen', **kwargs) as http, patch.object(bot.time, 'sleep') as sleep:
+                            with self.assertRaisesRegex(RuntimeError, expected) as exc:
+                                self.client.request(method, '/channels/1/messages', {'content': 'test'} if method != 'GET' else None)
+                            self.assertNotIn(TOKEN, str(exc.exception))
+                            http.assert_called_once()
+                            sleep.assert_not_called()
+
     def test_rate_limit_retry_bounded(self):
         def rate_error():
             return urllib.error.HTTPError('offline', 429, '', {}, io.BytesIO(b'{"retry_after":0.25}'))
@@ -393,12 +449,20 @@ class ClientTests(unittest.TestCase):
             self.assertNotIn(TOKEN, out.getvalue())
 
 class ConfigStateTests(unittest.TestCase):
+    def test_config_loads_without_usage_limits(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            write_config(root)
+            config = agent_state.load_config(root)
+            self.assertEqual(set(config), {'guild_id', 'owner_user_id', 'agents_category_id', 'upload_roots', 'read_channel_ids'})
+            self.assertEqual(config['upload_roots'], [(root / 'uploads').resolve()])
+
     def test_missing_config_and_every_required_key(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             with self.assertRaisesRegex(RuntimeError, 'config.toml'):
                 agent_state.load_config(root)
-            for key in ('guild_id', 'owner_user_id', 'agents_category_id', 'upload_roots', 'max_messages_per_session', 'max_channels_per_day'):
+            for key in ('guild_id', 'owner_user_id', 'agents_category_id', 'upload_roots'):
                 write_config(root)
                 path = root / 'config.toml'
                 path.write_text('\n'.join(line for line in path.read_text().splitlines() if not line.startswith(key + ' =')))
@@ -409,8 +473,7 @@ class ConfigStateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             for key, value in (('guild_id', 1), ('owner_user_id', 'owner'), ('agents_category_id', ''),
-                               ('upload_roots', 'folder'), ('max_messages_per_session', 0),
-                               ('max_channels_per_day', -1), ('read_channel_ids', ['channel'])):
+                               ('upload_roots', 'folder'), ('read_channel_ids', ['channel'])):
                 write_config(root, **{key: value})
                 with self.assertRaisesRegex(ValueError, key):
                     agent_state.load_config(root)
@@ -436,13 +499,13 @@ class ConfigStateTests(unittest.TestCase):
             root = Path(d)
             state = agent_state.State(root)
             session_id = state.register('claude')
-            state.update(session_id, title='Work', project_dir=str(root), thread_id='100', max_messages=2)
+            state.update(session_id, title='Work', project_dir=str(root), thread_id='100')
             state.close()
             with patch.object(agent_state, 'ROOT', root), patch('sys.argv', ['agent_state.py', 'sessions']), contextlib.redirect_stdout(io.StringIO()) as output:
                 agent_state.main()
             self.assertIn('claude', output.getvalue())
             self.assertIn('title=Work', output.getvalue())
-            self.assertIn('messages=0/2', output.getvalue())
+            self.assertNotIn('messages=', output.getvalue())
 
     def test_secret_sources_and_setup(self):
         with tempfile.TemporaryDirectory() as d:
@@ -466,7 +529,7 @@ class ConfigStateTests(unittest.TestCase):
             discord_client.main()
         req = http.call_args.args[0]
         self.assertEqual(json.loads(req.data)['username'], 'AI Agents')
-        self.assertIn('AI Agents', req.get_header('User-agent'))
+        self.assertEqual(req.get_header('User-agent'), 'AIAgentsToolkit/1.0')
         self.assertEqual(req.full_url, 'https://example.invalid?wait=true')
         self.assertEqual(out.getvalue().strip(), 'Delivered message: ok')
 
@@ -479,7 +542,7 @@ class ConfigStateTests(unittest.TestCase):
         with (root / 'config.example.toml').open('rb') as file:
             config = agent_state.tomllib.load(file)
         self.assertEqual(set(config), {'guild_id', 'owner_user_id', 'agents_category_id', 'upload_roots',
-                                      'max_messages_per_session', 'max_channels_per_day', 'read_channel_ids'})
+                                      'read_channel_ids'})
 
 if __name__ == '__main__':
     unittest.main()

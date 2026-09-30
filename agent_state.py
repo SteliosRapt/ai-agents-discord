@@ -18,16 +18,13 @@ def load_config(root=None):
         raise RuntimeError('Missing config.toml; copy and configure config.example.toml')
     with path.open('rb') as stream:
         config = tomllib.load(stream)
-    required = ('guild_id', 'owner_user_id', 'agents_category_id', 'upload_roots', 'max_messages_per_session', 'max_channels_per_day')
+    required = ('guild_id', 'owner_user_id', 'agents_category_id', 'upload_roots')
     for key in required:
         if key not in config:
             raise ValueError('Missing config key: ' + key)
     for key in ('guild_id', 'owner_user_id', 'agents_category_id'):
         if not isinstance(config[key], str) or not re.fullmatch(r'[0-9]+', config[key]):
             raise ValueError(key + ' must be a string of digits')
-    for key in ('max_messages_per_session', 'max_channels_per_day'):
-        if type(config[key]) is not int or config[key] < (1 if key == 'max_messages_per_session' else 0):
-            raise ValueError(key + ' must be a valid integer limit')
     roots = config['upload_roots']
     if not isinstance(roots, list) or any(not isinstance(p, str) or not p for p in roots):
         raise ValueError('upload_roots must be a list of paths')
@@ -73,7 +70,7 @@ class State:
                 id TEXT PRIMARY KEY, host TEXT, pid INTEGER, ppid INTEGER, cwd TEXT,
                 project_dir TEXT, started_at REAL, last_seen REAL, status TEXT,
                 title TEXT, plan TEXT, channel_id TEXT, thread_id TEXT,
-                status_message_id TEXT, messages_used INTEGER, max_messages INTEGER
+                status_message_id TEXT
             );
             CREATE TABLE IF NOT EXISTS project_channels (
                 project_dir TEXT PRIMARY KEY, channel_id TEXT, created_at REAL
@@ -86,7 +83,7 @@ class State:
 
     def register(self, host):
         session_id, now = uuid.uuid4().hex, time.time()
-        self.db.execute('INSERT INTO sessions (id, host, pid, ppid, cwd, started_at, last_seen, status, messages_used) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)',
+        self.db.execute('INSERT INTO sessions (id, host, pid, ppid, cwd, started_at, last_seen, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                         (session_id, host, os.getpid(), os.getppid(), str(Path.cwd()), now, now, 'connected'))
         return session_id
 
@@ -94,14 +91,14 @@ class State:
         return self.db.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
 
     def update(self, session_id, **values):
-        allowed = {'project_dir', 'status', 'title', 'plan', 'channel_id', 'thread_id', 'status_message_id', 'messages_used', 'max_messages'}
+        allowed = {'project_dir', 'status', 'title', 'plan', 'channel_id', 'thread_id', 'status_message_id'}
         if not values.keys() <= allowed:
             raise ValueError('Invalid session field')
         values['last_seen'] = time.time()
         self.db.execute('UPDATE sessions SET ' + ', '.join(k + '=?' for k in values) + ' WHERE id=?', (*values.values(), session_id))
 
-    def project_channel(self, project_dir, limit, create):
-        """Serialize mapping creation and the daily quota across processes."""
+    def project_channel(self, project_dir, create):
+        """Serialize mapping creation across processes."""
         self.db.execute('BEGIN IMMEDIATE')
         try:
             row = self.db.execute('SELECT channel_id FROM project_channels WHERE project_dir=?', (str(project_dir),)).fetchone()
@@ -109,10 +106,6 @@ class State:
                 channel_id = row['channel_id']
             else:
                 now = time.time()
-                today = now - now % 86400
-                count = self.db.execute('SELECT COUNT(*) FROM project_channels WHERE created_at>=?', (today,)).fetchone()[0]
-                if count >= limit:
-                    raise RuntimeError('Daily project channel creation limit reached')
                 channel_id = create()['id']
                 self.db.execute('INSERT INTO project_channels VALUES (?, ?, ?)', (str(project_dir), channel_id, now))
             self.db.execute('COMMIT')
@@ -134,7 +127,7 @@ def main():
             if process_alive(row['pid']):
                 folder = row['project_dir'] or row['cwd']
                 age = int(time.time() - row['started_at'])
-                print(f'{row["host"]} pid={row["pid"]} project={folder} title={row["title"] or ""} thread={row["thread_id"] or ""} messages={row["messages_used"]}/{row["max_messages"] or "-"} age={age}s')
+                print(f'{row["host"]} pid={row["pid"]} project={folder} title={row["title"] or ""} thread={row["thread_id"] or ""} age={age}s')
     finally:
         state.close()
 
