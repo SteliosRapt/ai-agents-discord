@@ -1,6 +1,16 @@
 # AI Agents Discord plugin — evolution plan (proposal, 2026-09-30)
 
-Status: **Phase 1 in progress** (bot-backed MCP server + dual manifests + skill). Phase 3 remote inbox is deferred by owner decision (see Decisions). Sources: Sol second opinion (ask `0930-202129-053`) and Sol web research (full cited report: `.orc/asks/0930-202129-020.final.md`).
+Status (2026-10-01): **phases 1–5 implemented, Codex-verified, merged**. See README "Tested" for what ran live.
+
+| Phase | Delivered |
+|---|---|
+| 1 | Bot-backed MCP server (9 tools), Claude + Codex manifests, discord skill, live E2E test |
+| 2 | Hook-fed session registry, file inbox, stdlib Gateway client, owner-only `/agents` + `/send` listener, autostart commands |
+| 3 | Reliable inbox delivery, zero-token alerts for thread-linked sessions (attention / long turn, owner-only ping), live `run_and_notify` status |
+| 4 | Independent Codex security + reliability review: 17 findings fixed, plus 3 races found while verifying |
+| 5 | No-posting live smoke test (`smoke_test.py`), waiting/working/idle state in `/agents` |
+
+Deferred by owner decision: remote task inbox / remote control. Not done (needs owner or low value): per-agent webhook identities (needs Manage Webhooks), message search, forum/digest, moving plugin files into a subfolder so the Codex cache copy excludes `.git`/`.orc`. Sources: Sol second opinion (ask `0930-202129-053`) and Sol web research (full cited report: `.orc/asks/0930-202129-020.final.md`).
 
 ## Answers to the direct questions
 
