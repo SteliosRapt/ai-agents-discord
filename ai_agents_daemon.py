@@ -16,6 +16,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 import agent_state
 from bot_client import BotClient, bot_token, snowflake
 from discord_gateway import Gateway, GatewayFatal
@@ -130,36 +131,54 @@ def download(attachment, handle):
     name = datetime.now(UTC).strftime('%Y%m%d-%H%M%S_') + safe_name(attachment.get('filename', 'file'))
     # Reserve the final name itself with an exclusive create (an empty placeholder), so concurrent /send calls
     # with the same file name in the same second can never pick the same destination; the finished download
-    # atomically replaces the placeholder.
+    # atomically replaces the placeholder. The temporary file has a random name (so 'foo.part' sent by the owner
+    # can't collide with foo's temporary file) and we only ever delete files this call created.
+    # Trust assumption: ~/.ai-agents and its ancestors are not writable by an attacker (no junction swaps).
     index = 0
     while True:
         base = Path(name)
         candidate = name if index == 0 else f'{base.stem}_{index}{base.suffix}'
         path = (folder / candidate).resolve()
-        part = folder / (candidate + '.part')
-        if not path.is_relative_to(folder) or not part.resolve().is_relative_to(folder):
+        if not path.is_relative_to(folder):
             raise ValueError('Attachment path escapes the inbox folder')
         try:
             path.open('xb').close()
             break
         except FileExistsError:
             index += 1
-    done = False
+    part = folder / f'.{uuid.uuid4().hex}.download'
+    part_created = done = False
     try:
-        with part.open('xb') as stream, urlopen(urllib.request.Request(url), timeout=55) as response:
-            count = 0
-            while chunk := response.read(65536):
-                stream.write(chunk)
-                count += len(chunk)
-            if size is not None and count != size:
-                raise ValueError('Attachment size mismatch')
-        os.replace(part, path)
+        with part.open('xb') as stream:
+            part_created = True
+            with urlopen(urllib.request.Request(url), timeout=55) as response:
+                count = 0
+                while chunk := response.read(65536):
+                    stream.write(chunk)
+                    count += len(chunk)
+                if size is not None and count != size:
+                    raise ValueError('Attachment size mismatch')
+        for attempt in range(5):
+            try:
+                os.replace(part, path)
+                break
+            except PermissionError:
+                # Antivirus/indexer handles can briefly block replacement (sharing violation).
+                if attempt == 4:
+                    raise
+                time.sleep(0.2)
         done = True
         return path
     finally:
-        part.unlink(missing_ok=True)
-        if not done:
-            path.unlink(missing_ok=True)
+        cleanup_error = None
+        for target, owned in ((part, part_created and not done), (path, not done)):
+            if owned:
+                try:
+                    target.unlink(missing_ok=True)
+                except OSError as exc:
+                    cleanup_error = cleanup_error or exc
+        if cleanup_error is not None and done is False:
+            raise RuntimeError(f'Download failed and cleanup was incomplete: {type(cleanup_error).__name__}')
 
 def project(row):
     return Path(row['cwd']).name

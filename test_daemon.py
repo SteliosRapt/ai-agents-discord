@@ -179,7 +179,27 @@ class ListenerTests(unittest.TestCase):
         self.assertNotIn('allowed_mentions', self.calls[0][2])
         self.assertEqual(self.calls[0][3], {'mentions': False})
         self.assertEqual(self.calls[2][2]['allowed_mentions'], {'parse': []})
-        self.assertEqual(list(path.parent.glob('*.part')), [])
+        self.assertEqual(sorted(p.name for p in path.parent.iterdir()), [path.name])  # no placeholder/temp left
+
+    def test_same_second_names_foo_and_foo_part_do_not_collide(self):
+        row = self.session()
+        fixed = Mock()
+        fixed.now.return_value.strftime.return_value = '20260930-120000_'
+        with patch.object(daemon, 'datetime', fixed):
+            for name in ('foo', 'foo.part', 'foo'):
+                self.listener.handle(send(row['handle'], filename=name, size=None, note=''), background=False)
+        folder = self.root / 'inbox' / row['handle']
+        self.assertEqual(sorted(p.name for p in folder.iterdir()),
+                         ['20260930-120000_foo', '20260930-120000_foo.part', '20260930-120000_foo_1'])
+        self.assertEqual(len(self.inbox()), 3)
+
+    def test_failed_download_leaves_no_placeholder_or_temp(self):
+        row = self.session()
+        self.urlopen.side_effect = lambda *a, **k: io.BytesIO(b'short')
+        self.listener.handle(send(row['handle'], filename='big.bin', size=999, note=''), background=False)
+        folder = self.root / 'inbox' / row['handle']
+        self.assertEqual(list(folder.iterdir()), [])
+        self.assertEqual(len(self.inbox()), 0)
 
     def test_send_without_thread_or_note_and_numeric_collision_suffix(self):
         row = self.session()
