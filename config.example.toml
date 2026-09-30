@@ -8,9 +8,5 @@ agents_category_id = "000000000000000003"
 # Only existing files resolved inside these directories may be uploaded.
 # Use TOML literal strings for Windows paths. An empty list disables uploads.
 upload_roots = ['C:\Users\YOUR_NAME\Projects']
-# Maximum counted posts an agent may request; starter/plan/final are separate.
-max_messages_per_session = 20
-# New project channels per UTC calendar day, shared by all local sessions.
-max_channels_per_day = 10
 # Optional additional channels agents may read. Own thread/project are implicit.
 read_channel_ids = ["000000000000000004"]

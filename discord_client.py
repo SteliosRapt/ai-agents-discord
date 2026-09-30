@@ -2,6 +2,7 @@
 import argparse
 import ctypes
 import getpass
+import http.client
 import json
 import mimetypes
 import os
@@ -68,7 +69,7 @@ def send(message, file=None, limit_mib=20):
         body, content_type = multipart(payload, file)
     else:
         body, content_type = json.dumps(payload).encode(), 'application/json'
-    req = urllib.request.Request(webhook() + '?wait=true', data=body, headers={'Content-Type': content_type, 'User-Agent': 'AI AgentsToolkit/1.0'})
+    req = urllib.request.Request(webhook() + '?wait=true', data=body, headers={'Content-Type': content_type, 'User-Agent': 'AIAgentsToolkit/1.0'})
     for attempt in range(5):
         try:
             with urllib.request.urlopen(req, timeout=180) as response:
@@ -78,15 +79,19 @@ def send(message, file=None, limit_mib=20):
                 error = json.loads(exc.read())
             except ValueError:
                 error = {}
+            except (urllib.error.URLError, OSError, http.client.HTTPException):
+                raise RuntimeError('Network failure; delivery uncertain. Check Discord before retrying.') from None
+            finally:
+                exc.close()
             if exc.code == 413 or error.get('code') == 40005:
                 raise TooLarge('Discord rejected the attachment size') from None
             if exc.code == 429 and attempt < 4:
                 time.sleep(max(1, float(error.get('retry_after', 5))))
                 continue
             raise RuntimeError(f'Discord returned HTTP {exc.code}') from None
-        except urllib.error.URLError:
+        except (urllib.error.URLError, OSError, http.client.HTTPException):
             # Delivery may have happened: do not automatically duplicate a timed-out POST.
-            raise RuntimeError('Network failure; delivery is uncertain. Check Discord before retrying.') from None
+            raise RuntimeError('Network failure; delivery uncertain. Check Discord before retrying.') from None
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

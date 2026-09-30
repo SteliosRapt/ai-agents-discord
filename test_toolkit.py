@@ -1,9 +1,11 @@
+import contextlib
+from http.client import HTTPException, BadStatusLine
 import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import urllib.error
 import discord_client as client
 import send_video
@@ -31,6 +33,33 @@ class Tests(unittest.TestCase):
         with patch.object(client, 'webhook', return_value='https://example.invalid'), patch.object(client.urllib.request, 'urlopen', side_effect=[error, io.BytesIO(b'{"id":"ok"}')]), patch.object(client.time, 'sleep') as sleep:
             self.assertEqual(client.send('test')['id'], 'ok')
             sleep.assert_called_once_with(2)
+
+    def test_raw_network_errors_during_open_and_read(self):
+        private = 'offline-private-credential'
+        for stage in ('open', 'read', 'error_read'):
+            for error_type in (TimeoutError, OSError, HTTPException, BadStatusLine):
+                with self.subTest(stage=stage, error_type=error_type):
+                    error = error_type(private)
+                    response = Mock()
+                    response.read.side_effect = error
+                    if stage == 'open':
+                        kwargs = {'side_effect': error}
+                    elif stage == 'read':
+                        kwargs = {'return_value': contextlib.nullcontext(response)}
+                    else:
+                        kwargs = {'side_effect': urllib.error.HTTPError('https://example.invalid', 429, private, {}, response)}
+                    with patch.object(client, 'webhook', return_value='https://example.invalid'), patch.object(client.urllib.request, 'urlopen', **kwargs) as http, patch.object(client.time, 'sleep') as sleep:
+                        with self.assertRaisesRegex(RuntimeError, 'delivery uncertain') as exc:
+                            client.send('test')
+                        self.assertNotIn(private, str(exc.exception))
+                        self.assertNotIn('https://example.invalid', str(exc.exception))
+                        http.assert_called_once()
+                        sleep.assert_not_called()
+
+    def test_user_agent(self):
+        with patch.object(client, 'webhook', return_value='https://example.invalid'), patch.object(client.urllib.request, 'urlopen', return_value=io.BytesIO(b'{"id":"ok"}')) as http:
+            client.send('test')
+        self.assertEqual(http.call_args.args[0].get_header('User-agent'), 'AIAgentsToolkit/1.0')
 
     def test_video_tiers(self):
         with tempfile.TemporaryDirectory() as d:

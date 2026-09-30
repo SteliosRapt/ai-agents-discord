@@ -1,6 +1,7 @@
 """Discord REST v10 bot client; credentials stay local and encrypted."""
 import argparse
 import getpass
+import http.client
 import json
 import os
 from pathlib import Path
@@ -75,6 +76,10 @@ class BotClient:
                         error = {}
                 except ValueError:
                     error = {}
+                except (urllib.error.URLError, OSError, http.client.HTTPException):
+                    if method in ('POST', 'PATCH'):
+                        raise RuntimeError('delivery uncertain, check Discord before retrying') from None
+                    raise RuntimeError('Discord network request failed') from None
                 finally:
                     exc.close()
                 if exc.code == 413 or error.get('code') == 40005:
@@ -91,7 +96,7 @@ class BotClient:
                 code = error.get('code')
                 detail = f' code {code}' if isinstance(code, int) else ''
                 raise RuntimeError(f'Discord returned HTTP {exc.code}{detail}: {message}') from None
-            except urllib.error.URLError:
+            except (urllib.error.URLError, OSError, http.client.HTTPException):
                 if method in ('POST', 'PATCH'):
                     raise RuntimeError('delivery uncertain, check Discord before retrying') from None
                 raise RuntimeError('Discord network request failed') from None
