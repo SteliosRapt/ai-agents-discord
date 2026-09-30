@@ -10,10 +10,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from agent_state import ROOT as DATA
 from discord_client import crypt, multipart, TooLarge
 
-ROOT = Path(__file__).resolve().parent
-SECRET = ROOT / 'bot_token.dpapi'
+SECRET = DATA / 'bot_token.dpapi'
 API = 'https://discord.com/api/v10'
 
 def validate_token(value):
@@ -140,6 +140,7 @@ def main():
     args = parser.parse_args()
     if args.action == 'setup':
         value = validate_token(getpass.getpass('Discord bot token (hidden): ').strip())
+        SECRET.parent.mkdir(exist_ok=True)
         SECRET.write_text(crypt(value.encode('utf-16-le'), True).hex(), encoding='utf-8')
         print('Saved encrypted bot credential for this Windows account.')
         return

@@ -6,7 +6,7 @@ import re
 import threading
 import time
 from mcp.server.fastmcp import FastMCP
-from agent_state import load_config, State
+from agent_state import load_config, State, ROOT as DATA
 from bot_client import BotClient, check_content, snowflake
 from discord_client import TooLarge
 from send_video import deliver_video
@@ -22,6 +22,7 @@ class AgentSession:
     def __init__(self, host, root=None):
         if host not in ('claude', 'codex'):
             raise ValueError('host must be claude or codex')
+        self.data = Path(root).resolve() if root is not None else DATA
         self.config = load_config(root)
         self.state = State(root)
         self.host = host
@@ -51,8 +52,8 @@ class AgentSession:
         result = []
         for path in paths:
             resolved = Path(path).resolve()
-            if resolved.is_relative_to(TOOLKIT) or resolved.suffix.lower() == '.dpapi':
-                raise ValueError('Toolkit and credential files cannot be uploaded')
+            if resolved.is_relative_to(TOOLKIT) or resolved.is_relative_to(self.data) or resolved.suffix.lower() == '.dpapi':
+                raise ValueError('Toolkit, plugin data and credential files cannot be uploaded')
             if not any(resolved.is_relative_to(root) for root in self.config['upload_roots']):
                 raise ValueError('File is outside configured upload_roots')
             if not resolved.is_file():

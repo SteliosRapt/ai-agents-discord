@@ -77,12 +77,15 @@ class SessionTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        self.project = self.root / 'My_Project'
+        base = Path(temporary.name)
+        # Data root (config/state) and uploads are separate, like ~/.ai-agents vs. project folders.
+        self.root = base / 'data'
+        self.root.mkdir()
+        self.project = base / 'My_Project'
         self.project.mkdir()
-        self.uploads = self.root / 'uploads'
+        self.uploads = base / 'uploads'
         self.uploads.mkdir()
-        write_config(self.root)
+        write_config(self.root, upload_roots=[str(self.uploads)])
         self.http = DiscordHTTP()
         self.urlopen = self.enterContext(patch.object(bot.urllib.request, 'urlopen', side_effect=self.http))
         self.enterContext(patch.object(bot, 'bot_token', return_value=TOKEN))
@@ -294,6 +297,13 @@ class SessionTests(unittest.TestCase):
         self.assertIn('after=' + question_id, self.http.calls[-1][3].full_url)
         self.assert_no_http(lambda: self.session.check_answer(question_id, 51), ValueError)
         self.assert_no_http(lambda: self.session.check_answer('not-owned'), ValueError)
+
+    def test_plugin_data_folder_blocked_even_inside_upload_roots(self):
+        self.start()
+        (self.root / 'notes.txt').write_text('private', encoding='utf-8')
+        self.session.config['upload_roots'] = [self.root.parent]
+        self.assert_no_http(lambda: self.session.post_milestone('x', [str(self.root / 'notes.txt')]), ValueError)
+        self.assert_no_http(lambda: self.session.post_milestone('x', [str(self.root / 'config.toml')]), ValueError)
 
     def test_answer_window_ends_at_next_question(self):
         self.start()

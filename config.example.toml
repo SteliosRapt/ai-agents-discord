@@ -1,3 +1,4 @@
+# Copy to %USERPROFILE%\.ai-agents\config.toml (shared by the Claude and Codex plugin copies).
 # Copy to config.toml and replace every placeholder with your Discord ids/paths.
 # The Discord server is AI Agents. All ids must be quoted strings of digits.
 guild_id = "000000000000000001"

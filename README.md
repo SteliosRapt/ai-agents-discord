@@ -14,13 +14,13 @@ Neither path falls back to the other.
    - Create a private bot (Public Bot off, Install Link = None) with the **Message Content** intent.
    - Invite it with `bot` + `applications.commands` and View Channels, Send Messages, Send Messages in Threads, Create Public Threads, Read Message History, Attach Files, Embed Links and Add Reactions.
    - Grant its role **Manage Channels on the AGENTS category only**.
-2. **Config:** copy `config.example.toml` to `config.toml` (gitignored) and fill in the server, owner, AGENTS-category and read-channel IDs plus `upload_roots`.
-3. **Token:** run `py bot_client.py setup` and paste the token at the hidden prompt. It is stored DPAPI-encrypted in `bot_token.dpapi` (gitignored) and only decrypts under this Windows account. `DISCORD_BOT_TOKEN` in the environment overrides it.
+2. **Config:** copy `config.example.toml` to `%USERPROFILE%\.ai-agents\config.toml` and fill in the server, owner, AGENTS-category and read-channel IDs plus `upload_roots`. All runtime data (config, tokens, `state.db`) lives in that folder, not in the plugin folder: Claude and Codex each install their own copy of the plugin, but share one config, one token and one session registry.
+3. **Token:** run `py bot_client.py setup` and paste the token at the hidden prompt. It is stored DPAPI-encrypted in `%USERPROFILE%\.ai-agentsot_token.dpapi` and only decrypts under this Windows account. `DISCORD_BOT_TOKEN` in the environment overrides it.
 4. **Check:** run `py bot_client.py doctor`. It makes read-only requests and never prints the token.
 5. **Python:** `mcp` (see `requirements.txt`) must be importable by `py` for the account that runs Claude Code/Codex.
 
 ### Install
-Both manifests live in this folder: `.claude-plugin/` and `.mcp.json` for Claude; `.codex-plugin/`, `codex.mcp.json` and `.agents/plugins/marketplace.json` for Codex. The skill in `skills/discord/` is shared.
+Both manifests live in this folder: `.claude-plugin/` and `claude.mcp.json` for Claude (deliberately not `.mcp.json`, which Claude would also load as a broken project server when working in this folder); `.codex-plugin/`, `codex.mcp.json` and `.agents/plugins/marketplace.json` for Codex. The skill in `skills/discord/` is shared.
 
 ```text
 claude plugin marketplace add C:\Users\user\Desktop\Discord_Agent_Toolkit
@@ -49,7 +49,7 @@ Behaviour is guided by `skills/discord/SKILL.md` rather than enforced quotas:
 **Answering a question:** post anything in that agent's thread after the question. Only your user ID counts, only in that thread, and only until the agent's next question. Answers reach the agent as untrusted data.
 
 **Safety:**
-- Uploads must resolve inside `upload_roots`. Files in this toolkit folder and any `*.dpapi` file are always refused.
+- Uploads must resolve inside `upload_roots`. Files in the plugin folder, in `~/.ai-agents`, and any `*.dpapi` file are always refused.
 - Agents can read only their own thread, their project channel and `read_channel_ids`.
 - There are no delete, moderation or role tools, and mentions are disabled.
 - Caveat: DPAPI protects the token from other Windows accounts, not from code running as you. The bot's Discord permissions are the real boundary.
@@ -80,7 +80,7 @@ To configure another webhook, run `python discord_client.py setup`. Paste its UR
 
 ## Credentials and Windows execution
 
-`webhook.dpapi` contains the URL encrypted by Windows DPAPI. It only decrypts under the Windows account/environment that saved it. It was copied from the working notification setup; no project paths are needed to use it. If another account or sandbox cannot decrypt it, run setup in the same environment that will execute the sender. Alternatively supply `DISCORD_WEBHOOK_URL` privately as an environment variable. Do not put a webhook in documentation, command history, commits, or tool output.
+`%USERPROFILE%\.ai-agents\webhook.dpapi` contains the URL encrypted by Windows DPAPI. It only decrypts under the Windows account/environment that saved it. It was copied from the working notification setup; no project paths are needed to use it. If another account or sandbox cannot decrypt it, run setup in the same environment that will execute the sender. Alternatively supply `DISCORD_WEBHOOK_URL` privately as an environment variable. Do not put a webhook in documentation, command history, commits, or tool output.
 
 The earlier project setup encountered two issues: sandboxed processes lacked network access, and credentials encrypted under the sandbox identity could not be read by the normal Windows process. Running the sender with authorized network access and configuring DPAPI under that same account solved both. This toolkit decrypts directly through Windows APIs, avoiding PowerShell module-loading problems.
 

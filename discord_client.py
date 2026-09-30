@@ -13,8 +13,8 @@ import urllib.error
 import urllib.request
 import uuid
 
-ROOT = Path(__file__).resolve().parent
-SECRET = ROOT / 'webhook.dpapi'
+# Same data folder as the plugin (see agent_state.ROOT): credentials never live in plugin copies.
+SECRET = Path.home() / '.ai-agents' / 'webhook.dpapi'
 
 class TooLarge(RuntimeError):
     pass
@@ -104,6 +104,7 @@ def main():
         value = getpass.getpass('Discord webhook URL (hidden): ').strip()
         if not re.fullmatch(r'https://(?:discord.com|discordapp.com)/api/webhooks/\d+/[A-Za-z0-9_-]+', value):
             raise ValueError('Invalid Discord webhook URL')
+        SECRET.parent.mkdir(exist_ok=True)
         SECRET.write_text(crypt(value.encode('utf-16-le'), True).hex(), encoding='utf-8')
         print('Saved encrypted webhook for this Windows account.')
     else:

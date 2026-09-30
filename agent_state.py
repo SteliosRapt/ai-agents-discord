@@ -9,13 +9,15 @@ import time
 import tomllib
 import uuid
 
-ROOT = Path(__file__).resolve().parent
+# Runtime data lives outside the plugin folder: Claude and Codex each install their own copy of the
+# plugin, but config, token and the session registry must be one shared set.
+ROOT = Path.home() / '.ai-agents'
 
 def load_config(root=None):
     root = Path(root) if root is not None else ROOT
     path = root / 'config.toml'
     if not path.is_file():
-        raise RuntimeError('Missing config.toml; copy and configure config.example.toml')
+        raise RuntimeError(f'Missing {path}; copy config.example.toml there and fill it in')
     with path.open('rb') as stream:
         config = tomllib.load(stream)
     required = ('guild_id', 'owner_user_id', 'agents_category_id', 'upload_roots')
