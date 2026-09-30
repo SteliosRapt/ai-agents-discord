@@ -15,6 +15,8 @@ import time
 import urllib.parse
 
 MAX_FRAME = 16 * 1024 * 1024
+WRITE_TIMEOUT = 5
+CLOSE_TIMEOUT = 0.25
 FATAL_CODES = {4004, 4010, 4011, 4012, 4013, 4014}
 
 def print_to_stderr(message):
@@ -102,7 +104,8 @@ class WebSocket:
         result, self.buffered = self.buffered[:size], self.buffered[size:]
         return result
 
-    def _send(self, opcode, payload):
+    def _send(self, opcode, payload, timeout=None):
+        timeout = WRITE_TIMEOUT if timeout is None else timeout
         length = len(payload)
         if length > MAX_FRAME:
             raise ValueError('WebSocket frame exceeds 16 MiB')
@@ -115,10 +118,35 @@ class WebSocket:
             header += b'\xff' + struct.pack('!Q', length)
         mask = os.urandom(4)
         masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
-        with self.send_lock:
+        if not self.send_lock.acquire(timeout=timeout):
+            self._shutdown()
+            raise TimeoutError('WebSocket write lock timed out')
+        expired = threading.Event()
+
+        def expire():
+            expired.set()
+            self._shutdown()
+
+        timer = threading.Timer(timeout, expire)
+        timer.daemon = True
+        try:
             if self.closed:
                 raise WebSocketClosed(1006, 'Connection is closed')
-            self.sock.sendall(header + mask + masked)
+            # Shutdown from another thread interrupts sendall, including a stalled TLS write.
+            timer.start()
+            try:
+                self.sock.sendall(header + mask + masked)
+            except OSError:
+                if expired.is_set():
+                    raise TimeoutError('WebSocket write timed out') from None
+                raise
+            if expired.is_set():
+                raise TimeoutError('WebSocket write timed out')
+        finally:
+            timer.cancel()
+            if timer.ident is not None:
+                timer.join()
+            self.send_lock.release()
 
     def send_text(self, text):
         self._send(1, text.encode('utf-8'))
@@ -151,8 +179,8 @@ class WebSocket:
                 code = struct.unpack('!H', payload[:2])[0] if payload else 1005
                 reason = payload[2:].decode('utf-8')
                 try:
-                    self._send(8, payload)
-                except OSError:
+                    self._send(8, payload, timeout=CLOSE_TIMEOUT)
+                except (OSError, WebSocketClosed):
                     pass
                 finally:
                     self._shutdown()
@@ -178,13 +206,17 @@ class WebSocket:
             self.sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
-        self.sock.close()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
 
     def close(self, code=1000):
         if self.closed:
             return
         try:
-            self._send(8, struct.pack('!H', code))
+            # Do not wait indefinitely behind a writer; a stalled transport cannot send close.
+            self._send(8, struct.pack('!H', code), timeout=CLOSE_TIMEOUT)
         except (OSError, WebSocketClosed):
             pass
         finally:
@@ -229,7 +261,6 @@ class Gateway:
         def heartbeat_loop():
             while not done.wait(0.05):
                 if stop_event.is_set():
-                    ws.close(1000)
                     return
                 with lock:
                     deadline = state['deadline']
@@ -243,8 +274,17 @@ class Gateway:
                         ws.close(4000)
                         return
 
+        def watch_stop():
+            # Heartbeats can be writing (and holding lock) when the owner requests shutdown.
+            while not done.wait(0.05):
+                if stop_event.is_set():
+                    ws.close(1000)
+                    return
+
         thread = threading.Thread(target=heartbeat_loop, name='discord-heartbeat', daemon=True)
+        stop_thread = threading.Thread(target=watch_stop, name='discord-stop', daemon=True)
         thread.start()
+        stop_thread.start()
         try:
             hello = json.loads(ws.recv())
             if hello.get('op') != 10:
@@ -299,6 +339,7 @@ class Gateway:
             # Discord invalidates sessions on 1000/1001; reconnects must keep them resumable.
             ws.close(1000 if stop_event.is_set() else 4000)
             thread.join()
+            stop_thread.join()
 
     def run(self, stop_event):
         backoff = 1

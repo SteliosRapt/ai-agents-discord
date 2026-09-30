@@ -61,6 +61,34 @@ class MemorySocket:
     def close(self):
         self.closed = True
 
+class BlockingSocket(MemorySocket):
+    def __init__(self, incoming=b'', block_op=None):
+        super().__init__(incoming)
+        self.block_op = block_op
+        self.blocked = threading.Event()
+        self.shutdown_called = threading.Event()
+
+    def recv(self, size):
+        if self.incoming:
+            return super().recv(size)
+        if not self.shutdown_called.wait(3):
+            raise TimeoutError('Blocked receive was not interrupted')
+        return b''
+
+    def sendall(self, data):
+        opcode, payload = unmask(data)
+        op = json.loads(payload)['op'] if opcode == 1 and self.block_op is not None else 'close'
+        self.sent.append(data)
+        if self.block_op is None or op == self.block_op:
+            self.blocked.set()
+            # Intentionally ignore socket timeouts: only shutdown releases the write.
+            if not self.shutdown_called.wait(3):
+                raise TimeoutError('Blocked write was not interrupted')
+            raise OSError('Write interrupted by shutdown')
+
+    def shutdown(self, how):
+        self.shutdown_called.set()
+
 class WebSocketTests(unittest.TestCase):
     def test_send_mask_and_all_length_encodings(self):
         for length, marker in ((0, 0), (125, 125), (126, 126), (65535, 126), (65536, 127)):
@@ -169,6 +197,87 @@ class WebSocketTests(unittest.TestCase):
             with self.assertRaises(ssl.SSLCertVerificationError):
                 gateway.WebSocket.connect('wss://example', 1)
         self.assertTrue(sock.closed)
+
+    def test_close_interrupts_blocked_writer_without_waiting_for_write_timeout(self):
+        sock = BlockingSocket()
+        ws = gateway.WebSocket(sock)
+        errors = []
+
+        def write():
+            try:
+                ws.send_text('blocked')
+            except Exception as exc:
+                errors.append(exc)
+
+        writer = threading.Thread(target=write, daemon=True)
+        with patch.object(gateway, 'CLOSE_TIMEOUT', 0.05):
+            writer.start()
+            try:
+                self.assertTrue(sock.blocked.wait(1))
+                closer = threading.Thread(target=ws.close, daemon=True)
+                closer.start()
+                closer.join(1)
+                self.assertFalse(closer.is_alive(), 'close waited for the blocked writer')
+                self.assertTrue(sock.shutdown_called.is_set())
+                writer.join(1)
+                self.assertFalse(writer.is_alive(), 'shutdown did not release sendall')
+                self.assertEqual(len(errors), 1)
+            finally:
+                sock.shutdown(gateway.socket.SHUT_RDWR)
+                writer.join(1)
+
+    def test_blocked_close_frame_has_bounded_write(self):
+        sock = BlockingSocket()
+        ws = gateway.WebSocket(sock)
+        with patch.object(gateway, 'CLOSE_TIMEOUT', 0.05):
+            closer = threading.Thread(target=ws.close, daemon=True)
+            closer.start()
+            try:
+                self.assertTrue(sock.blocked.wait(1))
+                closer.join(1)
+                self.assertFalse(closer.is_alive(), 'close frame write stalled shutdown')
+                self.assertTrue(sock.shutdown_called.is_set())
+                self.assertEqual(unmask(sock.sent[0]), (8, struct.pack('!H', 1000)))
+            finally:
+                sock.shutdown(gateway.socket.SHUT_RDWR)
+                closer.join(1)
+
+    def test_blocked_data_write_times_out_and_shuts_down_socket(self):
+        sock = BlockingSocket()
+        ws = gateway.WebSocket(sock)
+        with patch.object(gateway, 'WRITE_TIMEOUT', 0.05):
+            with self.assertRaisesRegex(TimeoutError, 'WebSocket write timed out'):
+                ws.send_text('blocked')
+        self.assertTrue(sock.blocked.is_set())
+        self.assertTrue(sock.shutdown_called.is_set())
+        self.assertTrue(sock.closed)
+
+    def test_remote_close_survives_blocked_echo_and_preserves_close_code(self):
+        sock = BlockingSocket(frame(struct.pack('!H', 4004) + b'auth failed', opcode=8))
+        ws = gateway.WebSocket(sock)
+        errors = []
+
+        def write():
+            try:
+                ws.send_text('blocked')
+            except Exception as exc:
+                errors.append(exc)
+
+        writer = threading.Thread(target=write, daemon=True)
+        with patch.object(gateway, 'CLOSE_TIMEOUT', 0.05):
+            writer.start()
+            try:
+                self.assertTrue(sock.blocked.wait(1))
+                with self.assertRaises(gateway.WebSocketClosed) as raised:
+                    ws.recv()
+                self.assertEqual((raised.exception.code, raised.exception.reason), (4004, 'auth failed'))
+                self.assertTrue(sock.shutdown_called.is_set())
+                writer.join(1)
+                self.assertFalse(writer.is_alive())
+                self.assertEqual(len(errors), 1)
+            finally:
+                sock.shutdown(gateway.socket.SHUT_RDWR)
+                writer.join(1)
 
 class Stop:
     def __init__(self):
@@ -422,6 +531,75 @@ class GatewayTests(unittest.TestCase):
         self.stop.wait = wait
         self.run_script(OSError('offline'))
         self.assertEqual(self.stop.waits, [1])
+
+    def test_stop_interrupts_blocked_identify_heartbeats_and_close(self):
+        for phase in ('identify', 'requested heartbeat', 'scheduled heartbeat', 'close'):
+            with self.subTest(phase=phase):
+                self.stop = Stop()
+                self.clock = 0
+                dispatched = threading.Event()
+                errors = []
+                events = [HELLO]
+                if phase != 'identify':
+                    events.append(READY)
+                if phase == 'requested heartbeat':
+                    events.append(event(1))
+                block_op = 2 if phase == 'identify' else 'close' if phase == 'close' else 1
+                sock = BlockingSocket(b''.join(frame(json.dumps(e).encode()) for e in events), block_op)
+                ws = gateway.WebSocket(sock)
+
+                def on_dispatch(name, data):
+                    dispatched.set()
+                    if phase == 'scheduled heartbeat':
+                        self.clock = 0.5
+
+                client = gateway.Gateway(TOKEN, on_dispatch, 'wss://offline.example', log=self.logs.append)
+
+                def run():
+                    try:
+                        client.run(self.stop)
+                    except Exception as exc:
+                        errors.append(exc)
+
+                with patch.object(gateway.WebSocket, 'connect', return_value=ws) as connect, patch.object(gateway, 'CLOSE_TIMEOUT', 0.05):
+                    worker = threading.Thread(target=run, daemon=True)
+                    worker.start()
+                    try:
+                        if phase == 'close':
+                            self.assertTrue(dispatched.wait(1))
+                            self.stop.set()
+                        self.assertTrue(sock.blocked.wait(1), 'probe did not enter blocked sendall')
+                        self.stop.set()
+                        worker.join(1)
+                        self.assertFalse(worker.is_alive(), 'run did not return after stop')
+                        self.assertTrue(sock.shutdown_called.is_set(), 'socket shutdown was not attempted')
+                        self.assertEqual(errors, [])
+                        self.assertEqual(self.logs, [])
+                        connect.assert_called_once()
+                        if phase == 'close':
+                            self.assertEqual(unmask(sock.sent[-1]), (8, struct.pack('!H', 1000)))
+                    finally:
+                        self.stop.set()
+                        sock.shutdown(gateway.socket.SHUT_RDWR)
+                        worker.join(1)
+
+    def test_stalled_scheduled_heartbeat_write_reconnects_with_resume(self):
+        sock = BlockingSocket(frame(json.dumps(HELLO).encode()) + frame(json.dumps(READY).encode()), block_op=1)
+        ws = gateway.WebSocket(sock)
+
+        def on_dispatch(name, data):
+            if name == 'READY':
+                self.clock = 0.5
+
+        self.client.on_dispatch = on_dispatch
+        second = ScriptSocket(HELLO, self.finish)
+        with patch.object(gateway, 'WRITE_TIMEOUT', 0.05), patch.object(gateway, 'CLOSE_TIMEOUT', 0.05):
+            self.run_script(ws, second)
+        self.assertTrue(sock.blocked.is_set())
+        self.assertTrue(sock.shutdown_called.is_set())
+        self.assertEqual(second.sent[0], {'op': 6, 'd': {'token': TOKEN, 'session_id': 'session', 'seq': 42}})
+        self.assertEqual(self.stop.waits, [1])
+        self.assertNotIn(TOKEN, '\n'.join(self.logs))
 
 if __name__ == '__main__':
     unittest.main()
