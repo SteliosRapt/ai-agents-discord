@@ -15,7 +15,7 @@ Neither path falls back to the other.
    - Invite it with `bot` + `applications.commands` and View Channels, Send Messages, Send Messages in Threads, Create Public Threads, Read Message History, Attach Files, Embed Links and Add Reactions.
    - Grant its role **Manage Channels on the AGENTS category only**.
 2. **Config:** copy `config.example.toml` to `%USERPROFILE%\.ai-agents\config.toml` and fill in the server, owner, AGENTS-category and read-channel IDs plus `upload_roots`. All runtime data (config, tokens, `state.db`) lives in that folder, not in the plugin folder: Claude and Codex each install their own copy of the plugin, but share one config, one token and one session registry.
-3. **Token:** run `py bot_client.py setup` and paste the token at the hidden prompt. It is stored DPAPI-encrypted in `%USERPROFILE%\.ai-agentsot_token.dpapi` and only decrypts under this Windows account. `DISCORD_BOT_TOKEN` in the environment overrides it.
+3. **Token:** run `py bot_client.py setup` and paste the token at the hidden prompt. It is stored DPAPI-encrypted in `%USERPROFILE%\.ai-agents\bot_token.dpapi` and only decrypts under this Windows account. `DISCORD_BOT_TOKEN` in the environment overrides it.
 4. **Check:** run `py bot_client.py doctor`. It makes read-only requests and never prints the token.
 5. **Python:** `mcp` (see `requirements.txt`) must be importable by `py` for the account that runs Claude Code/Codex.
 
