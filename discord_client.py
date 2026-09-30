@@ -69,7 +69,19 @@ def send(message, file=None, limit_mib=20):
         body, content_type = multipart(payload, file)
     else:
         body, content_type = json.dumps(payload).encode(), 'application/json'
-    req = urllib.request.Request(webhook() + '?wait=true', data=body, headers={'Content-Type': content_type, 'User-Agent': 'AIAgentsToolkit/1.0'})
+    return _request('POST', '?wait=true', body, content_type)
+
+def edit(message_id, content):
+    if not re.fullmatch(r'[0-9]+', str(message_id)):
+        raise ValueError('Discord message id must contain digits only')
+    if len(content) > 2000:
+        raise ValueError('Discord message must be at most 2000 characters')
+    payload = {'content': content, 'allowed_mentions': {'parse': []}}
+    return _request('PATCH', '/messages/' + str(message_id), json.dumps(payload).encode(), 'application/json')
+
+def _request(method, suffix, body, content_type):
+    req = urllib.request.Request(webhook() + suffix, data=body,
+                                 headers={'Content-Type': content_type, 'User-Agent': 'AIAgentsToolkit/1.0'}, method=method)
     for attempt in range(5):
         try:
             with urllib.request.urlopen(req, timeout=180) as response:
@@ -77,6 +89,8 @@ def send(message, file=None, limit_mib=20):
         except urllib.error.HTTPError as exc:
             try:
                 error = json.loads(exc.read())
+                if not isinstance(error, dict):
+                    error = {}
             except ValueError:
                 error = {}
             except (urllib.error.URLError, OSError, http.client.HTTPException):
@@ -86,11 +100,14 @@ def send(message, file=None, limit_mib=20):
             if exc.code == 413 or error.get('code') == 40005:
                 raise TooLarge('Discord rejected the attachment size') from None
             if exc.code == 429 and attempt < 4:
-                time.sleep(max(1, float(error.get('retry_after', 5))))
+                delay = error.get('retry_after', 5)
+                if not isinstance(delay, (int, float)) or not 0 <= delay < float('inf'):
+                    raise RuntimeError('Discord returned HTTP 429 with invalid retry_after') from None
+                time.sleep(max(1, delay))
                 continue
             raise RuntimeError(f'Discord returned HTTP {exc.code}') from None
         except (urllib.error.URLError, OSError, http.client.HTTPException):
-            # Delivery may have happened: do not automatically duplicate a timed-out POST.
+            # Delivery may have happened: do not automatically repeat a timed-out POST/PATCH.
             raise RuntimeError('Network failure; delivery uncertain. Check Discord before retrying.') from None
 
 def main():
