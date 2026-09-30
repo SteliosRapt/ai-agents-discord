@@ -34,7 +34,7 @@ Before doing the work, tell the user in chat exactly when you'll post (for examp
 ## Questions to the owner
 
 - Use `ask_owner(question)` only when you are blocked on a decision you can't make yourself. Say what you'll do meanwhile or by default.
-- The owner answers by posting in your thread after your question (a plain message or a Reply). Their messages in other channels or threads never count.
+- The owner answers by posting in your thread after your question: a plain message, or a Reply to your question. Replies they address to other messages, and anything in other channels or threads, never count.
 - Check with `check_answer(question_id, wait_seconds)` at natural points (≤ 50 s per call). Don't loop on it for minutes. Continue other work, or end the turn and tell the user in chat that you're waiting for their Discord reply.
 
 ## Files the owner sends you
