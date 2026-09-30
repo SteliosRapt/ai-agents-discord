@@ -1,4 +1,5 @@
 import ast
+import builtins
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import ctypes
@@ -6,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import runpy
 import sqlite3
 import sys
 import tempfile
@@ -114,6 +116,144 @@ class StateTests(unittest.TestCase):
         self.state.db.execute('DROP TRIGGER reject_delivery')
         self.assertEqual(len(self.state.take_inbox('one')), 1)
 
+    def test_staggered_events_do_not_retry_an_active_delivery(self):
+        item = self.state.add_inbox('one', self.root / 'file.txt', 'note', 'owner')
+        other = agent_state.State(self.root)
+        self.addCleanup(other.close)
+        committed, resume = threading.Event(), threading.Event()
+        db = self.state.db
+        class PausedCommit:
+            def execute(self, sql, *args):
+                result = db.execute(sql, *args)
+                if sql == 'COMMIT':
+                    committed.set()
+                    if not resume.wait(timeout=5):
+                        raise AssertionError('first take was not resumed')
+                return result
+            def __getattr__(self, name):
+                return getattr(db, name)
+        self.state.db = PausedCommit()
+        with patch.object(agent_state.time, 'time', side_effect=lambda: 100 if threading.current_thread().name.startswith('first-take') else 101), ThreadPoolExecutor(max_workers=1, thread_name_prefix='first-take') as pool:
+            first = pool.submit(self.state.take_inbox, 'one', retry_before=100, event='UserPromptSubmit')
+            try:
+                self.assertTrue(committed.wait(timeout=5))
+                self.assertFalse(first.done())
+                # The second event starts later, after the first claim was committed.
+                self.assertEqual(other.take_inbox('one', retry_before=101, event='UserPromptSubmit'), [])
+                other.confirm_inbox('one', 'Stop', 101)
+                self.assertIsNone(other.db.execute('SELECT confirmed_at FROM inbox WHERE id=?', (item,)).fetchone()[0])
+            finally:
+                resume.set()
+            self.assertEqual([row['id'] for row in first.result(timeout=5)], [item])
+        self.state.db = db
+        self.assertEqual(other.take_inbox('one', retry_before=102, event='UserPromptSubmit'), [])
+        with patch.object(agent_state.time, 'time', return_value=102):
+            self.state.finish_inbox()
+        # A delayed take from the already-overlapping event must also stay empty after release.
+        self.assertEqual(other.take_inbox('one', retry_before=101, event='UserPromptSubmit'), [])
+        with patch.object(agent_state.time, 'time', return_value=103):
+            replay = other.take_inbox('one', retry_before=103, event='PostToolUse')
+        self.assertEqual([row['id'] for row in replay], [item])
+        self.assertEqual(replay[0]['delivered_at'], 102)
+
+    def test_delivery_claims_are_released_only_by_their_owner(self):
+        first = self.state.add_inbox('one', 'first.txt', 'first', 'owner')
+        self.state.take_inbox('one', event='UserPromptSubmit')
+        second = self.state.add_inbox('one', 'second.txt', 'second', 'owner')
+        other = agent_state.State(self.root)
+        self.addCleanup(other.close)
+        self.assertEqual([row['id'] for row in other.take_inbox('one', event='UserPromptSubmit')], [second])
+        self.state.finish_inbox()
+        rows = {row['id']: row for row in self.state.db.execute('SELECT * FROM inbox')}
+        self.assertIsNone(rows[first]['delivery_pid'])
+        self.assertIsNone(rows[first]['delivery_owner'])
+        self.assertEqual(rows[second]['delivery_pid'], os.getpid())
+        self.assertIsNotNone(rows[second]['delivery_owner'])
+
+    def test_dead_delivery_owner_is_replayed_not_prematurely_confirmed(self):
+        item = self.state.add_inbox('one', 'file.txt', 'note', 'owner')
+        self.state.db.execute("UPDATE inbox SET delivered_at=100, delivered_event='PostToolUse', delivery_pid=999, delivery_owner='abandoned'")
+        self.state.confirm_inbox('one', 'Stop', 101)
+        self.assertIsNone(self.state.db.execute('SELECT confirmed_at FROM inbox').fetchone()[0])
+        with patch.object(agent_state, 'process_alive', return_value=False) as alive, patch.object(agent_state.time, 'time', return_value=101):
+            rows = self.state.take_inbox('one', retry_before=101, event='PostToolUse')
+        alive.assert_called_once_with(999)
+        self.assertEqual([(row['id'], row['delivered_at']) for row in rows], [(item, 100)])
+        with patch.object(agent_state.time, 'time', return_value=102):
+            self.state.finish_inbox()
+        self.state.confirm_inbox('one', 'PostToolUse', 103)
+        self.assertEqual(self.state.take_inbox('one', retry_before=104, event='UserPromptSubmit'), [])
+
+    def test_delivery_liveness_failure_rolls_back_and_raises(self):
+        self.state.add_inbox('one', 'file.txt', 'note', 'owner')
+        self.state.db.execute("UPDATE inbox SET delivered_at=100, delivery_pid=999, delivery_owner='abandoned'")
+        with patch.object(agent_state, 'process_alive', side_effect=RuntimeError('Cannot query delivery process')):
+            with self.assertRaisesRegex(RuntimeError, 'Cannot query delivery process'):
+                self.state.take_inbox('one', retry_before=101, event='UserPromptSubmit')
+        self.assertFalse(self.state.db.in_transaction)
+        self.assertEqual(self.state.db.execute('SELECT delivery_owner FROM inbox').fetchone()[0], 'abandoned')
+
+    def test_failed_replay_restores_the_previous_delivery(self):
+        self.state.add_inbox('one', 'file.txt', 'note', 'owner')
+        self.state.db.execute("UPDATE inbox SET delivered_at=100, delivered_event='UserPromptSubmit'")
+        with patch.object(agent_state.time, 'time', return_value=101):
+            self.state.take_inbox('one', retry_before=101, event='PostToolUse')
+        self.state.finish_inbox(delivered=False)
+        row = self.state.db.execute('SELECT * FROM inbox').fetchone()
+        self.assertEqual((row['delivered_at'], row['delivered_event'], row['delivery_pid'], row['delivery_owner']),
+                         (100, 'UserPromptSubmit', None, None))
+
+    def test_failed_replay_restores_an_abandoned_claim_for_later_recovery(self):
+        self.state.add_inbox('one', 'file.txt', 'note', 'owner')
+        self.state.db.execute("UPDATE inbox SET delivered_at=100, delivered_event='PostToolUse', delivery_pid=999, delivery_owner='abandoned'")
+        with patch.object(agent_state, 'process_alive', return_value=False):
+            self.state.take_inbox('one', retry_before=101, event='PostToolUse')
+        self.state.finish_inbox(delivered=False)
+        row = self.state.db.execute('SELECT * FROM inbox').fetchone()
+        self.assertEqual((row['delivered_at'], row['delivered_event'], row['delivery_pid'], row['delivery_owner']),
+                         (100, 'PostToolUse', 999, 'abandoned'))
+        self.state.confirm_inbox('one', 'Stop', 102)
+        self.assertIsNone(self.state.db.execute('SELECT confirmed_at FROM inbox').fetchone()[0])
+        with patch.object(agent_state, 'process_alive', return_value=False):
+            self.assertEqual(len(self.state.take_inbox('one', retry_before=102, event='PostToolUse')), 1)
+
+    def test_phase_two_schema_migrates_existing_host_and_inbox_rows(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            with contextlib.closing(sqlite3.connect(root / 'state.db')) as db:
+                db.executescript('''
+                    CREATE TABLE host_sessions (host_session_id TEXT PRIMARY KEY, host TEXT, handle TEXT UNIQUE,
+                        cwd TEXT, host_pid INTEGER, started_at REAL, last_seen REAL, last_event TEXT, ended_at REAL,
+                        mcp_session_id TEXT, thread_id TEXT, title TEXT);
+                    CREATE TABLE inbox (id INTEGER PRIMARY KEY AUTOINCREMENT, host_session_id TEXT, path TEXT,
+                        note TEXT, sender_id TEXT, created_at REAL, delivered_at REAL);
+                    INSERT INTO host_sessions VALUES ('old-host', 'claude', 'abcd', '.', NULL, 1, 2, 'Stop', NULL, 'mcp', '123', 'Old task');
+                    INSERT INTO inbox VALUES (1, 'old-host', 'pending.txt', 'pending', '2', 1, NULL);
+                    INSERT INTO inbox VALUES (2, 'old-host', 'sent.txt', 'unconfirmed', '2', 1, 2);
+                ''')
+            for _ in range(2):
+                state = agent_state.State(root)
+                try:
+                    row = state.host_session_by_handle('abcd')
+                    self.assertEqual((row['thread_id'], row['title']), ('123', 'Old task'))
+                    self.assertIsNone(row['last_prompt_at'])
+                    self.assertEqual([row['confirmed_at'] for row in state.db.execute('SELECT * FROM inbox')], [None, None])
+                    self.assertEqual(sum(row['name'] == 'confirmed_at' for row in state.db.execute('PRAGMA table_info(inbox)')), 1)
+                finally:
+                    state.close()
+            state = agent_state.State(root)
+            try:
+                with patch.object(agent_state.time, 'time', return_value=10):
+                    state.confirm_inbox('old-host', 'PostToolUse', 10)
+                    rows = state.take_inbox('old-host', retry_before=10, event='PostToolUse')
+                self.assertEqual([(row['id'], row['delivered_at']) for row in rows], [(1, None), (2, 2)])
+                with patch.object(agent_state.time, 'time', return_value=10):
+                    state.finish_inbox()
+                state.confirm_inbox('old-host', 'PostToolUse', 11)
+                self.assertEqual(state.take_inbox('old-host', retry_before=12, event='PostToolUse'), [])
+            finally:
+                state.close()
+
     def test_concurrent_touches_preserve_one_handle(self):
         other = agent_state.State(self.root)
         self.addCleanup(other.close)
@@ -167,9 +307,9 @@ class StateTests(unittest.TestCase):
                 tables = {row[0] for row in state.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 self.assertTrue({'host_sessions', 'inbox'} <= tables)
                 self.assertEqual([row[1] for row in state.db.execute('PRAGMA table_info(host_sessions)')],
-                                 ['host_session_id', 'host', 'handle', 'cwd', 'host_pid', 'started_at', 'last_seen', 'last_event', 'ended_at', 'mcp_session_id', 'thread_id', 'title'])
+                                 ['host_session_id', 'host', 'handle', 'cwd', 'host_pid', 'started_at', 'last_seen', 'last_event', 'ended_at', 'mcp_session_id', 'thread_id', 'title', 'last_prompt_at'])
                 self.assertEqual([row[1] for row in state.db.execute('PRAGMA table_info(inbox)')],
-                                 ['id', 'host_session_id', 'path', 'note', 'sender_id', 'created_at', 'delivered_at'])
+                                 ['id', 'host_session_id', 'path', 'note', 'sender_id', 'created_at', 'delivered_at', 'confirmed_at', 'delivered_event', 'delivery_pid', 'delivery_owner'])
             finally:
                 state.close()
 
@@ -205,7 +345,11 @@ class HookTests(unittest.TestCase):
                                 'AI Agents inbox: the owner sent you these via Discord /send\n'
                                 f'{paths[0]}: Please inspect\n{paths[1]}: Owner note'}}
                     self.assertEqual((code, out, err), (0, json.dumps(expected) + '\n', ''))
-                    self.assertEqual(self.run_hook(event, host, session_id=session), (0, '', ''))
+                    if event == 'PostToolUse':
+                        self.assertEqual(self.run_hook(event, host, session_id=session), (0, '', ''))
+                    else:
+                        expected['hookSpecificOutput']['additionalContext'] = expected['hookSpecificOutput']['additionalContext'].replace('Please inspect', 'Please inspect (re-sent)').replace('Owner note', 'Owner note (re-sent)')
+                        self.assertEqual(self.run_hook(event, host, session_id=session), (0, json.dumps(expected) + '\n', ''))
                     row = self.state.db.execute('SELECT * FROM host_sessions WHERE host_session_id=?', (session,)).fetchone()
                     self.assertEqual((row['host'], row['cwd'], row['host_pid'], row['last_event']), (host, str(self.root), 42, event))
 
@@ -263,15 +407,222 @@ class HookTests(unittest.TestCase):
         self.assertEqual(self.state.db.execute('SELECT COUNT(*) FROM host_sessions').fetchone()[0], 0)
 
     def test_hook_imports_only_stdlib_and_agent_state(self):
-        source = Path(session_hook.__file__).read_text()
+        source = Path(session_hook.__file__).read_text(encoding='utf-8')
         imports = []
-        for node in ast.walk(ast.parse(source)):
+        for node in ast.parse(source).body:
             if isinstance(node, ast.Import):
                 imports.extend(alias.name.split('.')[0] for alias in node.names)
             elif isinstance(node, ast.ImportFrom):
                 imports.append(node.module.split('.')[0])
         self.assertTrue(set(imports) <= sys.stdlib_module_names | {'agent_state'})
         self.assertFalse({'mcp', 'bot_client', 'discord_client'} & set(imports))
+
+    def test_no_alert_path_never_imports_bot(self):
+        original = builtins.__import__
+        def import_module(name, *args, **kwargs):
+            if name.split('.')[0] in ('bot_client', 'discord_client', 'mcp'):
+                raise AssertionError('unexpected import: ' + name)
+            return original(name, *args, **kwargs)
+        with patch('builtins.__import__', side_effect=import_module):
+            namespace = runpy.run_path(str(Path(session_hook.__file__)))
+            for host in ('claude', 'codex'):
+                for event in ('SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Stop', 'SessionEnd', 'Notification', 'PermissionRequest'):
+                    payload = {'session_id': 'unlinked', 'hook_event_name': event, 'cwd': str(self.root)}
+                    with patch('sys.argv', ['session_hook.py', '--host', host]), patch('sys.stdin', io.StringIO(json.dumps(payload))), contextlib.redirect_stdout(io.StringIO()) as out:
+                        self.assertEqual(namespace['main'](), 0)
+                    self.assertEqual(out.getvalue(), '')
+            row = self.state.touch_host_session('claude', 'linked', self.root, None, 'Stop')
+            self.state.link_host_session('linked', 'a' * 32, '123', 'Work')
+            for event in ('SessionStart', 'PostToolUse', 'Stop', 'SessionEnd', 'PermissionRequest'):
+                self.assertEqual(self.run_hook(event, session_id='linked'), (0, '', ''))
+            (self.root / 'config.toml').write_text('guild_id="1"\nowner_user_id="2"\nagents_category_id="3"\nupload_roots=[]\n', encoding='utf-8')
+            with patch.object(agent_state.time, 'time', return_value=100):
+                self.assertEqual(self.run_hook('UserPromptSubmit', session_id='linked'), (0, '', ''))
+            with patch.object(agent_state.time, 'time', return_value=101):
+                self.assertEqual(self.run_hook('Stop', session_id='linked'), (0, '', ''))
+
+    def test_prompt_delivery_replays_then_tool_delivery_confirms(self):
+        for next_event in ('UserPromptSubmit', 'PostToolUse'):
+            with self.subTest(next_event=next_event):
+                session = 'replay-' + next_event
+                item = self.state.add_inbox(session, self.root / 'file.txt', 'Read this', 'owner')
+                with patch.object(agent_state.time, 'time', return_value=100):
+                    code, out, err = self.run_hook('UserPromptSubmit', session_id=session)
+                self.assertEqual((code, err), (0, ''))
+                self.assertNotIn('(re-sent)', out)
+                with patch.object(agent_state.time, 'time', return_value=200):
+                    code, out, err = self.run_hook(next_event, session_id=session)
+                self.assertEqual((code, err), (0, ''))
+                self.assertIn('(re-sent)', json.loads(out)['hookSpecificOutput']['additionalContext'])
+                with patch.object(agent_state.time, 'time', return_value=300):
+                    self.assertEqual(self.run_hook('Stop', session_id=session), (0, '', ''))
+                with patch.object(agent_state.time, 'time', return_value=400):
+                    self.assertEqual(self.run_hook('UserPromptSubmit', session_id=session), (0, '', ''))
+                self.assertEqual(self.state.db.execute('SELECT confirmed_at FROM inbox WHERE id=?', (item,)).fetchone()[0], 300)
+
+    def test_hook_retains_delivery_claim_through_remaining_duties(self):
+        self.state.add_inbox('host-1', self.root / 'file.txt', 'Read first', 'owner')
+        other = agent_state.State(self.root)
+        self.addCleanup(other.close)
+        def remaining_duties(host, row, payload):
+            self.assertIn('Read first', sys.stdout.getvalue())
+            self.assertEqual(other.take_inbox('host-1', retry_before=101, event='UserPromptSubmit'), [])
+            other.confirm_inbox('host-1', 'Stop', 101)
+            self.assertIsNone(other.db.execute('SELECT confirmed_at FROM inbox').fetchone()[0])
+            return 0
+        with patch.object(agent_state.time, 'time', return_value=100), patch.object(session_hook, 'post_alert', side_effect=remaining_duties):
+            self.assertEqual(self.run_hook('UserPromptSubmit')[0], 0)
+        row = self.state.db.execute('SELECT * FROM inbox').fetchone()
+        self.assertIsNone(row['delivery_pid'])
+        self.assertIsNone(row['delivery_owner'])
+        with patch.object(agent_state.time, 'time', return_value=102):
+            self.assertIn('(re-sent)', self.run_hook('UserPromptSubmit')[1])
+
+    def test_failed_stdout_restores_pending_delivery(self):
+        self.state.add_inbox('host-1', self.root / 'file.txt', 'Read first', 'owner')
+        with patch.object(session_hook, 'print', create=True, side_effect=OSError('offline stdout failure')):
+            with self.assertRaisesRegex(OSError, 'offline stdout failure'):
+                self.run_hook('PostToolUse')
+        row = self.state.db.execute('SELECT * FROM inbox').fetchone()
+        self.assertIsNone(row['delivered_at'])
+        self.assertIsNone(row['delivery_pid'])
+        self.assertIsNone(row['delivery_owner'])
+        code, out, err = self.run_hook('PostToolUse')
+        self.assertEqual((code, err), (0, ''))
+        self.assertIn('Read first', out)
+        self.assertNotIn('(re-sent)', out)
+
+    def test_tool_delivery_confirms_only_previous_items_on_post_or_stop(self):
+        for confirm_event in ('PostToolUse', 'Stop'):
+            session = 'confirm-' + confirm_event
+            first = self.state.add_inbox(session, self.root / 'first.txt', 'First', 'owner')
+            other = self.state.add_inbox('other-session', self.root / 'other.txt', 'Other', 'owner')
+            with patch.object(agent_state.time, 'time', return_value=100):
+                self.assertIn('First', self.run_hook('PostToolUse', session_id=session)[1])
+            second = self.state.add_inbox(session, self.root / 'second.txt', 'Second', 'owner')
+            with patch.object(agent_state.time, 'time', return_value=200):
+                code, out, err = self.run_hook(confirm_event, session_id=session)
+            self.assertEqual((code, err), (0, ''))
+            self.assertNotIn('First', out)
+            self.assertNotIn('(re-sent)', out)
+            self.assertEqual('Second' in out, confirm_event == 'PostToolUse')
+            rows = {row['id']: row for row in self.state.db.execute('SELECT * FROM inbox')}
+            self.assertEqual(rows[first]['confirmed_at'], 200)
+            self.assertIsNone(rows[second]['confirmed_at'])
+            self.assertIsNone(rows[other]['confirmed_at'])
+            with patch.object(agent_state.time, 'time', return_value=300):
+                self.assertEqual(self.run_hook('PostToolUse', session_id=session)[1] == '', confirm_event == 'PostToolUse')
+
+    def prepare_alert(self, host='claude', **overrides):
+        import bot_client as bot
+        config = {'guild_id': '1', 'owner_user_id': '2', 'agents_category_id': '3', 'upload_roots': []}
+        config.update(overrides)
+        (self.root / 'config.toml').write_text('\n'.join(f'{key} = {json.dumps(value)}' for key, value in config.items()), encoding='utf-8')
+        self.state.touch_host_session(host, 'host-1', self.root, 42, 'SessionStart')
+        self.state.link_host_session('host-1', 'a' * 32, '123', 'Opted in')
+        self.enterContext(patch.object(bot, 'bot_token', return_value='offline-private-bot-token'))
+        return self.enterContext(patch.object(bot.urllib.request, 'urlopen', side_effect=lambda *a, **k: io.BytesIO(b'{"id":"1"}')))
+
+    def alert_payload(self, http):
+        request = http.call_args.args[0]
+        self.assertTrue(request.full_url.endswith('/channels/123/messages'))
+        return json.loads(request.data)
+
+    def test_claude_notification_truncates_and_pings_owner(self):
+        http = self.prepare_alert()
+        self.assertEqual(self.run_hook('Notification', message='x' * 400 + ' @everyone'), (0, '', ''))
+        self.assertEqual(self.alert_payload(http), {'content': '<@2> ⏳ Needs your attention: ' + 'x' * 300,
+                                                   'allowed_mentions': {'parse': [], 'users': ['2']}})
+        http.assert_called_once()
+
+    def test_codex_permission_summary_and_no_ping(self):
+        http = self.prepare_alert('codex', alert_mentions_owner=False)
+        tool_input = {'command': 'x' * 400}
+        self.assertEqual(self.run_hook('PermissionRequest', 'codex', tool_name='Bash', tool_input=tool_input), (0, '', ''))
+        summary = ('Bash ' + json.dumps(tool_input))[:300]
+        self.assertEqual(self.alert_payload(http), {'content': '⏳ Codex is waiting for approval: ' + summary,
+                                                   'allowed_mentions': {'parse': []}})
+        http.assert_called_once()
+
+    def test_only_linked_matching_host_and_events_alert(self):
+        http = self.prepare_alert()
+        for event, host in [('Notification', 'codex'), ('PermissionRequest', 'claude'), ('SessionStart', 'claude'),
+                             ('UserPromptSubmit', 'claude'), ('PostToolUse', 'claude'), ('SessionEnd', 'claude')]:
+            self.assertEqual(self.run_hook(event, host, message='Attention'), (0, '', ''))
+        for event, host in [('Notification', 'claude'), ('PermissionRequest', 'codex'), ('Stop', 'claude')]:
+            self.assertEqual(self.run_hook(event, host, session_id='unlinked', message='Attention'), (0, '', ''))
+        http.assert_not_called()
+
+    def test_stop_threshold_last_prompt_and_truncated_summary(self):
+        for host in ('claude', 'codex'):
+            http = self.prepare_alert(host)
+            self.assertEqual(self.run_hook('Stop', host), (0, '', ''))
+            http.assert_not_called()
+            with patch.object(agent_state.time, 'time', return_value=100):
+                self.assertEqual(self.run_hook('UserPromptSubmit', host), (0, '', ''))
+            with patch.object(agent_state.time, 'time', return_value=699):
+                self.assertEqual(self.run_hook('Stop', host), (0, '', ''))
+            http.assert_not_called()
+            with patch.object(agent_state.time, 'time', return_value=700):
+                self.assertEqual(self.run_hook('Stop', host, last_assistant_message='s' * 400), (0, '', ''))
+            self.assertEqual(self.alert_payload(http)['content'], '<@2> ✅ Turn finished after 10 min: ' + 's' * 300)
+            with patch.object(agent_state.time, 'time', return_value=800):
+                self.assertEqual(self.run_hook('UserPromptSubmit', host), (0, '', ''))
+            with patch.object(agent_state.time, 'time', return_value=801):
+                self.assertEqual(self.run_hook('Stop', host), (0, '', ''))
+            self.assertEqual(http.call_count, 1)
+            self.state.db.execute('UPDATE host_sessions SET last_prompt_at=NULL WHERE host_session_id=?', ('host-1',))
+
+    def test_stop_custom_threshold_and_no_summary(self):
+        http = self.prepare_alert(long_turn_minutes=2, alert_mentions_owner=False)
+        with patch.object(agent_state.time, 'time', return_value=100):
+            self.run_hook('UserPromptSubmit')
+        with patch.object(agent_state.time, 'time', return_value=220):
+            self.assertEqual(self.run_hook('Stop'), (0, '', ''))
+        self.assertEqual(self.alert_payload(http), {'content': '✅ Turn finished after 2 min', 'allowed_mentions': {'parse': []}})
+
+    def test_failed_alert_is_visible_and_never_echoes_secrets(self):
+        import urllib.error
+        http = self.prepare_alert()
+        secret = 'offline-private-bot-token'
+        http.side_effect = urllib.error.URLError(secret + ' Authorization: secret https://discord.com/api/webhooks/1/private interaction-secret')
+        code, out, err = self.run_hook('Notification', message='Attention')
+        self.assertEqual((code, out), (1, ''))
+        self.assertIn('could not post Discord alert', err)
+        self.assertIn('delivery may be uncertain', err)
+        for value in (secret, 'Authorization', 'webhooks/', 'interaction-secret'):
+            self.assertNotIn(value, err)
+        http.assert_called_once()
+        self.assertEqual(self.state.db.execute('SELECT last_event FROM host_sessions').fetchone()[0], 'Notification')
+
+    def test_inbox_stdout_precedes_alert_failure(self):
+        http = self.prepare_alert()
+        http.side_effect = OSError('offline-private-bot-token')
+        item = self.state.add_inbox('host-1', self.root / 'file.txt', 'Read first', 'owner')
+        post_alert = session_hook.post_alert
+        def post_after_delivery(host, row, payload):
+            self.assertIn('Read first', sys.stdout.getvalue())
+            # Alert events do not normally deliver inbox items; force an alert to exercise duty ordering.
+            return post_alert(host, row, dict(payload, hook_event_name='Notification', message='Attention'))
+        with patch.object(session_hook, 'post_alert', side_effect=post_after_delivery):
+            code, out, err = self.run_hook('PostToolUse')
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out)['hookSpecificOutput']['hookEventName'], 'PostToolUse')
+        self.assertIn('could not post Discord alert', err)
+        self.assertNotIn('offline-private-bot-token', out + err)
+        self.assertIsNotNone(self.state.db.execute('SELECT delivered_at FROM inbox WHERE id=?', (item,)).fetchone()[0])
+
+    def test_invalid_alert_config_reports_failure_without_bot_import(self):
+        self.prepare_alert(long_turn_minutes=0)
+        original = builtins.__import__
+        def import_module(name, *args, **kwargs):
+            if name == 'bot_client':
+                raise AssertionError('bot imported before config validation')
+            return original(name, *args, **kwargs)
+        with patch('builtins.__import__', side_effect=import_module):
+            code, out, err = self.run_hook('Notification', message='Attention')
+        self.assertEqual((code, out), (1, ''))
+        self.assertIn('could not load alert config (ValueError)', err)
 
 class ProcessTests(unittest.TestCase):
     def kernel(self, entries):

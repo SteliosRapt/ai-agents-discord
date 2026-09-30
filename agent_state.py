@@ -85,6 +85,14 @@ def load_config(root=None):
     if not isinstance(ids, list) or any(not isinstance(i, str) or not re.fullmatch(r'[0-9]+', i) for i in ids):
         raise ValueError('read_channel_ids must be a list of strings of digits')
     config['read_channel_ids'] = ids
+    minutes = config.get('long_turn_minutes', 10)
+    if type(minutes) is not int or minutes < 1:
+        raise ValueError('long_turn_minutes must be an integer of at least 1')
+    mentions = config.get('alert_mentions_owner', True)
+    if type(mentions) is not bool:
+        raise ValueError('alert_mentions_owner must be a boolean')
+    config['long_turn_minutes'] = minutes
+    config['alert_mentions_owner'] = mentions
     return config
 
 def process_alive(pid):
@@ -113,6 +121,8 @@ def process_alive(pid):
 class State:
     def __init__(self, root=None):
         root = Path(root) if root is not None else ROOT
+        self._inbox_owner, self._inbox_claimed = uuid.uuid4().hex, False
+        self._inbox_previous = {}
         self.db = sqlite3.connect(root / 'state.db', timeout=30, check_same_thread=False, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.execute('PRAGMA journal_mode=WAL')
@@ -134,13 +144,28 @@ class State:
             CREATE TABLE IF NOT EXISTS host_sessions (
                 host_session_id TEXT PRIMARY KEY, host TEXT, handle TEXT UNIQUE, cwd TEXT,
                 host_pid INTEGER, started_at REAL, last_seen REAL, last_event TEXT,
-                ended_at REAL, mcp_session_id TEXT, thread_id TEXT, title TEXT
+                ended_at REAL, mcp_session_id TEXT, thread_id TEXT, title TEXT,
+                last_prompt_at REAL
             );
             CREATE TABLE IF NOT EXISTS inbox (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, host_session_id TEXT, path TEXT,
-                note TEXT, sender_id TEXT, created_at REAL, delivered_at REAL
+                note TEXT, sender_id TEXT, created_at REAL, delivered_at REAL,
+                confirmed_at REAL, delivered_event TEXT, delivery_pid INTEGER, delivery_owner TEXT
             );
         ''')
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            for table, column, kind in (('inbox', 'confirmed_at', 'REAL'), ('inbox', 'delivered_event', 'TEXT'),
+                                        ('inbox', 'delivery_pid', 'INTEGER'), ('inbox', 'delivery_owner', 'TEXT'),
+                                        ('host_sessions', 'last_prompt_at', 'REAL')):
+                columns = {row['name'] for row in self.db.execute('PRAGMA table_info(' + table + ')')}
+                if column not in columns:
+                    self.db.execute('ALTER TABLE ' + table + ' ADD COLUMN ' + column + ' ' + kind)
+            self.db.execute('COMMIT')
+        except BaseException:
+            self.db.execute('ROLLBACK')
+            self.db.close()
+            raise
 
     def register(self, host):
         session_id, now = uuid.uuid4().hex, time.time()
@@ -175,8 +200,11 @@ class State:
             self.db.execute('ROLLBACK')
             raise
 
-    def close(self):
-        self.db.close()
+    def close(self, *, inbox_delivered=True):
+        try:
+            self.finish_inbox(delivered=inbox_delivered)
+        finally:
+            self.db.close()
 
     def touch_host_session(self, host, host_session_id, cwd, host_pid, event):
         now = time.time()
@@ -192,6 +220,8 @@ class State:
                                 (host_session_id, host, handle, now))
             self.db.execute('UPDATE host_sessions SET last_seen=?, last_event=?, cwd=?, host_pid=?, ended_at=? WHERE host_session_id=?',
                             (now, event, str(cwd), host_pid, now if event == 'SessionEnd' else None, host_session_id))
+            if event == 'UserPromptSubmit':
+                self.db.execute('UPDATE host_sessions SET last_prompt_at=? WHERE host_session_id=?', (now, host_session_id))
             row = self.db.execute('SELECT * FROM host_sessions WHERE host_session_id=?', (host_session_id,)).fetchone()
             self.db.execute('COMMIT')
             return row
@@ -215,13 +245,71 @@ class State:
         return self.db.execute('INSERT INTO inbox (host_session_id, path, note, sender_id, created_at) VALUES (?, ?, ?, ?, ?)',
                                (host_session_id, str(path), note, sender_id, time.time())).lastrowid
 
-    def take_inbox(self, host_session_id):
+    def confirm_inbox(self, host_session_id, event, before):
+        """A tool step proves progress after tool delivery; Stop also confirms prompt delivery."""
+        if event not in ('PostToolUse', 'Stop'):
+            return
+        sql = 'SELECT * FROM inbox WHERE host_session_id=? AND confirmed_at IS NULL AND delivered_at<? AND delivery_pid IS NULL'
+        if event == 'PostToolUse':
+            # A failed prompt may never reach the model; replay it at the first successful tool step.
+            sql += " AND COALESCE(delivered_event, 'UserPromptSubmit') <> 'UserPromptSubmit'"
         self.db.execute('BEGIN IMMEDIATE')
         try:
-            rows = self.db.execute('SELECT * FROM inbox WHERE host_session_id=? AND delivered_at IS NULL ORDER BY id',
-                                   (host_session_id,)).fetchall()
-            self.db.execute('UPDATE inbox SET delivered_at=? WHERE host_session_id=? AND delivered_at IS NULL',
-                            (time.time(), host_session_id))
+            rows = self.db.execute(sql, (host_session_id, before)).fetchall()
+            self.db.executemany('UPDATE inbox SET confirmed_at=?, delivery_pid=NULL, delivery_owner=NULL WHERE id=?',
+                                ((before, row['id']) for row in rows))
+            self.db.execute('COMMIT')
+        except BaseException:
+            self.db.execute('ROLLBACK')
+            raise
+
+    def _inactive_inbox(self, rows):
+        alive = {}
+        available = []
+        for row in rows:
+            pid = row['delivery_pid']
+            if pid is not None:
+                if pid not in alive:
+                    alive[pid] = process_alive(pid)
+                if alive[pid]:
+                    continue
+            available.append(row)
+        return available
+
+    def finish_inbox(self, *, delivered=True):
+        """Release this State's claims after output/cleanup; dead processes are recoverable on take."""
+        if self._inbox_claimed:
+            # An event that began while output was active must not replay it after release either.
+            if delivered:
+                self.db.execute('UPDATE inbox SET delivered_at=?, delivery_pid=NULL, delivery_owner=NULL WHERE delivery_owner=?',
+                                (time.time(), self._inbox_owner))
+            else:
+                self.db.execute('BEGIN IMMEDIATE')
+                try:
+                    self.db.executemany('UPDATE inbox SET delivered_at=?, delivered_event=?, delivery_pid=?, delivery_owner=? '
+                                        'WHERE id=? AND delivery_owner=?',
+                                        ((*previous, item, self._inbox_owner) for item, previous in self._inbox_previous.items()))
+                    self.db.execute('COMMIT')
+                except BaseException:
+                    self.db.execute('ROLLBACK')
+                    raise
+            self._inbox_claimed = False
+            self._inbox_previous.clear()
+
+    def take_inbox(self, host_session_id, *, retry_before=None, event=None):
+        """Claim pending items, optionally replaying unconfirmed deliveries older than this event."""
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            rows = self.db.execute('SELECT * FROM inbox WHERE host_session_id=? AND confirmed_at IS NULL '
+                                   'AND (delivered_at IS NULL OR delivered_at<?) ORDER BY id',
+                                   (host_session_id, retry_before)).fetchall()
+            rows = self._inactive_inbox(rows)
+            if rows:
+                self._inbox_claimed = True
+                self._inbox_previous.update((row['id'], (row['delivered_at'], row['delivered_event'], row['delivery_pid'], row['delivery_owner'])) for row in rows)
+                now, pid = time.time(), os.getpid()
+                self.db.executemany('UPDATE inbox SET delivered_at=?, delivered_event=?, delivery_pid=?, delivery_owner=? WHERE id=?',
+                                    ((now, event, pid, self._inbox_owner, row['id']) for row in rows))
             self.db.execute('COMMIT')
             return rows
         except BaseException:

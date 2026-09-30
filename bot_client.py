@@ -110,11 +110,15 @@ class BotClient:
     def create_text_channel(self, name, parent_id):
         return self.request('POST', f'/guilds/{self.guild_id}/channels', {'name': name, 'type': 0, 'parent_id': snowflake(parent_id)})
 
-    def send_message(self, channel_id, content, files=(), reply_to=None):
+    def send_message(self, channel_id, content, files=(), reply_to=None, *, mention_users=()):
         check_content(content)
         payload = {'content': content}
         if reply_to is not None:
             payload['message_reference'] = {'message_id': snowflake(reply_to)}
+        users = [snowflake(user) for user in mention_users]
+        if users:
+            payload['allowed_mentions'] = {'parse': [], 'users': users}
+            return self.request('POST', f'/channels/{snowflake(channel_id)}/messages', payload, files, mentions=False)
         return self.request('POST', f'/channels/{snowflake(channel_id)}/messages', payload, files)
 
     def edit_message(self, channel_id, message_id, content):
