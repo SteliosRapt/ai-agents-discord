@@ -45,18 +45,22 @@ def webhook():
 
 def multipart(payload, path):
     boundary = uuid.uuid4().hex
+    paths = [path] if isinstance(path, Path) else list(path)
     # JSON quoting handles quotes and backslashes in ordinary filenames.
-    filename = path.name.replace('\r', '').replace('\n', '')
-    payload['attachments'] = [{'id': 0, 'filename': filename}]
+    filenames = [p.name.replace('\r', '').replace('\n', '') for p in paths]
+    payload['attachments'] = [{'id': i, 'filename': name} for i, name in enumerate(filenames)]
     data = (f'--{boundary}\r\nContent-Disposition: form-data; name="payload_json"\r\nContent-Type: application/json\r\n\r\n'.encode()
-            + json.dumps(payload).encode() + f'\r\n--{boundary}\r\nContent-Disposition: form-data; name="files[0]"; filename={json.dumps(filename)}\r\nContent-Type: {mimetypes.guess_type(filename)[0] or "application/octet-stream"}\r\n\r\n'.encode()
-            + path.read_bytes() + f'\r\n--{boundary}--\r\n'.encode())
+            + json.dumps(payload).encode())
+    for i, (p, filename) in enumerate(zip(paths, filenames)):
+        data += (f'\r\n--{boundary}\r\nContent-Disposition: form-data; name="files[{i}]"; filename={json.dumps(filename)}\r\nContent-Type: {mimetypes.guess_type(filename)[0] or "application/octet-stream"}\r\n\r\n'.encode()
+                 + p.read_bytes())
+    data += f'\r\n--{boundary}--\r\n'.encode()
     return data, 'multipart/form-data; boundary=' + boundary
 
 def send(message, file=None, limit_mib=20):
     if len(message) > 2000:
         raise ValueError('Discord message must be at most 2000 characters')
-    payload = {'username': 'NotifAIcations', 'content': message, 'allowed_mentions': {'parse': []}}
+    payload = {'username': 'AI Agents', 'content': message, 'allowed_mentions': {'parse': []}}
     if file:
         file = Path(file)
         if file.stat().st_size > limit_mib * 1024**2:
@@ -64,7 +68,7 @@ def send(message, file=None, limit_mib=20):
         body, content_type = multipart(payload, file)
     else:
         body, content_type = json.dumps(payload).encode(), 'application/json'
-    req = urllib.request.Request(webhook() + '?wait=true', data=body, headers={'Content-Type': content_type, 'User-Agent': 'NotifAIcationsToolkit/1.0'})
+    req = urllib.request.Request(webhook() + '?wait=true', data=body, headers={'Content-Type': content_type, 'User-Agent': 'AI AgentsToolkit/1.0'})
     for attempt in range(5):
         try:
             with urllib.request.urlopen(req, timeout=180) as response:
