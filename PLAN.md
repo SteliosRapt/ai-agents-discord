@@ -90,13 +90,13 @@ AI Agents
 
 ## Phase 2 design: `/agents`, targeted files, explicit tagging
 
-**Who is running.** Every Claude Code/Codex session with the plugin enabled starts its own `ai_agents_mcp.py` process at session start. That process writes a registry row (host, pid, launch time) **without any model call**, so the registry costs zero tokens. A `SessionStart` hook adds the session id and working directory (both hosts pass these to hooks), matched to the MCP process by their shared parent process. Dead processes are pruned by pid check. Sessions that never call `start_session` show as "idle, no thread".
+**Who is running (as built).** A command hook (`session_hook.py`, declared in `hooks/claude-hooks.json` and `hooks/codex-hooks.json`) runs on SessionStart, UserPromptSubmit, PostToolUse and SessionEnd in every Claude Code/Codex session. It records the host's own session id, working folder and host process id in `~/.ai-agents/state.db` (`host_sessions`), with a 4-character handle. No model call is involved; the cost is about 160 ms per event. When an agent's `start_session` tool call completes, the same hook links that session to its Discord thread and title. Liveness = not ended, recent activity, and host process alive. The earlier idea of matching MCP processes by parent pid was dropped: hooks see the real session id, and a Codex app process can host several threads.
 
 **The Discord command.** A small always-on local listener (`ai_agents_daemon.py`, hidden window, started at login by Task Scheduler after you approve that) holds the only Gateway connection. It registers owner-only guild slash commands:
 - `/agents`: lists live sessions with host · project · task title · thread link · last activity, visible only to you.
 - `/send agent:<autocomplete> file:<attachment> note:<text>`: downloads the attachment into `inbox/<session>/` and reacts ✅ with the saved path.
 
-**How the agent gets it (no interruption, no wrong agent).** Nothing is pushed into a session. The targeted session sees the file at its **next tool step**: a `PostToolUse` hook checks only its own inbox folder and injects one line ("Owner sent `<file>`: `<note>`"). Other sessions never see it. Idle sessions don't wake up; the daemon says "queued, agent is idle" instead. Empty-inbox checks are a file-exists test (no tokens).
+**How the agent gets it (no interruption, no wrong agent).** Nothing is pushed into a session. `/send` saves the file to `~/.ai-agents/inbox/<handle>/` plus an inbox row. The targeted session's own PostToolUse/UserPromptSubmit hook takes the pending rows atomically and injects them as `additionalContext` at that session's **next tool step or prompt**. Other sessions never see them; idle sessions don't wake up. The daemon's confirmation says the agent sees it at its next step. If the session has a thread, a visible note is also posted there.
 
 **Explicit tagging rules** (agents only react to):
 1. A **Discord Reply** to the agent's own `ask_owner` question, inside its thread. This is the answer path, and works today via `check_answer`.

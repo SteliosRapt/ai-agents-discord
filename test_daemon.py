@@ -468,7 +468,7 @@ class UtilityTests(unittest.TestCase):
             self.assertEqual(daemon.install_autostart(), 0)
             command = ['schtasks', '/Create', '/TN', daemon.TASK, '/SC', 'ONLOGON', '/RL', 'LIMITED', '/F', '/TR',
                        f'"{pythonw}" "{Path(daemon.__file__).resolve()}" run']
-            run.assert_called_once_with(command, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            run.assert_called_once_with(command, capture_output=True, encoding='oem', errors='replace', creationflags=subprocess.CREATE_NO_WINDOW)
             logger = daemon.Logger()
             for index in range(6):
                 logger(f'line-{index}')

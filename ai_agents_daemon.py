@@ -186,6 +186,9 @@ class Listener:
         self.pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='discord-interaction')
 
     def on_dispatch(self, name, data):
+        if name in ('READY', 'RESUMED'):
+            self.log(f'Gateway {name.lower()}')
+            return
         if name != 'INTERACTION_CREATE':
             return
         self.log.add_secret(data.get('token'))
@@ -359,7 +362,8 @@ def run_listener():
         return result
 
 def task_command(arguments):
-    result = subprocess.run(['schtasks', *arguments], capture_output=True, text=True,
+    # schtasks writes in the console (OEM) code page, e.g. cp737 on Greek Windows, not the ANSI one text=True assumes.
+    result = subprocess.run(['schtasks', *arguments], capture_output=True, encoding='oem', errors='replace',
                             creationflags=subprocess.CREATE_NO_WINDOW)
     return result
 
