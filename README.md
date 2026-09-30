@@ -59,6 +59,29 @@ Behaviour is guided by `skills/discord/SKILL.md` rather than enforced quotas:
 - There are no delete, moderation or role tools, and mentions are disabled.
 - Caveat: DPAPI protects the token from other Windows accounts, not from code running as you. The bot's Discord permissions are the real boundary.
 
+### Listener: `/agents` and `/send` from your phone
+`ai_agents_daemon.py` is a small local listener. It holds one Discord Gateway connection, uses a standard-library WebSocket client (no extra packages) and has no model access.
+
+```text
+py ai_agents_daemon.py run                    # foreground; logs to %USERPROFILE%\.ai-agents\daemon.log
+py ai_agents_daemon.py status                 # running?, autostart task, last log lines
+py ai_agents_daemon.py install-autostart      # Task Scheduler: start hidden (pythonw) at logon
+py ai_agents_daemon.py uninstall-autostart
+```
+
+- **`/agents`:** lists running Claude Code/Codex sessions. Each line shows a 4-character handle, the app, the project folder, the Discord task title and thread (if any), and the last activity. Only you see it.
+- **`/send agent:<handle> file:<attachment> note:<text>`:**
+  - The handle autocompletes.
+  - The file is saved to `%USERPROFILE%\.ai-agents\inbox\<handle>\`, and the session's thread (if any) gets a visible note.
+  - **Only that session** sees it, at its next tool call or prompt, as injected context. Idle sessions are not woken up.
+- **Access:** both commands are owner-only (checked by user ID and server ID) and hidden from non-admins.
+
+**Where the session list comes from:**
+- `session_hook.py` runs as a plugin hook (`hooks/claude-hooks.json`, `hooks/codex-hooks.json`) on SessionStart, UserPromptSubmit, PostToolUse and SessionEnd.
+- It records each session in `state.db` and delivers inbox items. It makes no model calls and costs about 160 ms per event.
+- Sessions appear after they start with the hooks installed; sessions already open need a restart.
+- **Codex skips plugin hooks until you trust them once in Codex's `/hooks` review.** Until then Codex sessions don't appear in `/agents` and can't receive `/send`, although their MCP tools work.
+
 ### Tested
 - **Offline:** `py test_toolkit.py`, `py test_agents.py`.
 - **Live, 2026-09-30:** one end-to-end run through the stdio MCP server against the real server:
@@ -68,7 +91,13 @@ Behaviour is guided by `skills/discord/SKILL.md` rather than enforced quotas:
 - **Installed, 2026-09-30:**
   - Claude: the plugin server connected in all open sessions.
   - Codex: a `codex exec` session started the plugin copy, decrypted the token from `~/.ai-agents` and called `list_channels` successfully.
+- **Phase 2, live 2026-10-01:**
+  - The listener connected to the real Gateway (READY) and registered `/agents` and `/send`.
+  - A fresh Claude session ran the hooks: SessionStart registered it, UserPromptSubmit took the queued inbox item, SessionEnd closed it.
+  - Codex 0.2.0 install and MCP tools work; its hooks await your `/hooks` trust.
 - **Not yet tested live:**
+  - `/agents` and `/send` issued from Discord (needs the owner)
+  - the model's reply to an injected inbox item (the standalone `claude` CLI login had expired)
   - `send_video` transcoding
   - a full posting session started by a real Claude or Codex agent (as opposed to the scripted MCP client)
 
