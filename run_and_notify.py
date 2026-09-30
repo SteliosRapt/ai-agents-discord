@@ -120,11 +120,23 @@ def run_job(command, name, every=60, log=None, *, encoding='utf-8', clock=time.m
                     tail.append(text)
 
             def cleanup_tree():
-                try:
-                    kill_tree(process)
-                except Exception as exc:
-                    note(f'Process tree cleanup failed: {exc}')
-                    report_failure('process tree cleanup', exc)
+                nonlocal code, abnormal
+                for attempt in range(2):
+                    try:
+                        kill_tree(process)
+                        return
+                    except KeyboardInterrupt:
+                        code, abnormal = 130, True
+                        if attempt == 0:
+                            note('Process tree cleanup interrupted by Ctrl+C; retrying')
+                        else:
+                            error = 'Interrupted twice by Ctrl+C; tree termination unconfirmed'
+                            note(f'Process tree cleanup failed: {error}')
+                            report_failure('process tree cleanup', error)
+                    except Exception as exc:
+                        note(f'Process tree cleanup failed: {exc}')
+                        report_failure('process tree cleanup', exc)
+                        return
 
             try:
                 reader.start()
@@ -190,8 +202,8 @@ def run_job(command, name, every=60, log=None, *, encoding='utf-8', clock=time.m
                         note(f'Job output failed: {event}')
                         report_failure('job output', event)
                         if not abnormal:
-                            cleanup_tree()
                             code = 1
+                            cleanup_tree()
     elapsed = elapsed_text(clock() - started)
     final = final or (f'\u2705 {name} finished in {elapsed}' if code == 0
                       else f'\u274c {name} failed (exit {code}) after {elapsed}')

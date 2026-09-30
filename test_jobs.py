@@ -278,6 +278,46 @@ class JobTests(unittest.TestCase):
         self.assertEqual(self.events[-1][:2], ('post', '❌ Build failed (exit 130) after 0s'))
         self.assertFalse(self.process.stdout.closed)
 
+    def test_ctrl_c_during_taskkill_retries_tree_cleanup_and_reports_final(self):
+        class HeldThread(ImmediateThread):
+            def start(self):
+                pass
+
+            def is_alive(self):
+                return True
+        for code, thread in ((0, HeldThread), (7, ImmediateThread)):
+            with self.subTest(code=code):
+                self.events.clear()
+                self.taskkill.reset_mock()
+                self.taskkill.side_effect = [KeyboardInterrupt(), Mock(returncode=0)]
+                with patch.object(jobs.threading, 'Thread', thread):
+                    result, _, err = self.run_job(code=code)
+                self.assertEqual((result, err), (130, ''))
+                self.assertEqual(self.taskkill.call_count, 2)
+                self.assertEqual(self.taskkill.call_args_list[0], self.taskkill.call_args_list[1])
+                self.assertEqual(self.taskkill.call_args.args[0],
+                                 ['taskkill', '/T', '/F', '/PID', str(self.process.pid)])
+                self.assertEqual(self.events[-2][2], '❌ Build failed (exit 130) after 0s')
+                self.assertEqual(self.events[-1][:2], ('post', '❌ Build failed (exit 130) after 0s'))
+                self.assertIn('Process tree cleanup interrupted by Ctrl+C; retrying', self.events[-1][3])
+
+    def test_repeated_ctrl_c_during_taskkill_is_bounded_and_reports_final(self):
+        class HeldThread(ImmediateThread):
+            def start(self):
+                pass
+
+            def is_alive(self):
+                return True
+        self.taskkill.side_effect = KeyboardInterrupt
+        with patch.object(jobs.threading, 'Thread', HeldThread):
+            result, _, err = self.run_job()
+        self.assertEqual(result, 130)
+        self.assertEqual(self.taskkill.call_count, 2)
+        self.assertIn('tree termination unconfirmed', err)
+        self.assertIn('tree termination unconfirmed', self.events[-1][3])
+        self.assertEqual(self.events[-2][2], '❌ Build failed (exit 130) after 0s')
+        self.assertEqual(self.events[-1][:2], ('post', '❌ Build failed (exit 130) after 0s'))
+
     def test_output_reader_error_kills_tree_and_still_reports_redacted_failure(self):
         secret = 'synthetic-reader-secret'
         class BrokenPipe:
