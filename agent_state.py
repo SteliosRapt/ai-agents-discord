@@ -13,6 +13,7 @@ import uuid
 # Runtime data lives outside the plugin folder: Claude and Codex each install their own copy of the
 # plugin, but config, token and the session registry must be one shared set.
 ROOT = Path.home() / '.ai-agents'
+SCHEMA_VERSION = 1
 SHELLS = {'py.exe', 'pyw.exe', 'python.exe', 'pythonw.exe', 'cmd.exe', 'bash.exe',
           'sh.exe', 'pwsh.exe', 'powershell.exe', 'conhost.exe', 'git-bash.exe'}
 
@@ -125,9 +126,26 @@ class State:
         self._inbox_previous = {}
         self.db = sqlite3.connect(root / 'state.db', timeout=30, check_same_thread=False, isolation_level=None)
         self.db.row_factory = sqlite3.Row
-        self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('PRAGMA busy_timeout=30000')
-        self.db.executescript('''
+        try:
+            if self.db.execute('PRAGMA journal_mode').fetchone()[0] != 'wal':
+                self.db.execute('PRAGMA journal_mode=WAL')
+            if self.db.execute('PRAGMA user_version').fetchone()[0] != SCHEMA_VERSION:
+                self._migrate()
+        except BaseException:
+            self.db.close()
+            raise
+
+    def _migrate(self):
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            version = self.db.execute('PRAGMA user_version').fetchone()[0]
+            if version > SCHEMA_VERSION:
+                raise RuntimeError('State database uses a newer schema version')
+            if version == SCHEMA_VERSION:
+                self.db.execute('COMMIT')
+                return
+            schema = '''
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY, host TEXT, pid INTEGER, ppid INTEGER, cwd TEXT,
                 project_dir TEXT, started_at REAL, last_seen REAL, status TEXT,
@@ -135,7 +153,8 @@ class State:
                 status_message_id TEXT
             );
             CREATE TABLE IF NOT EXISTS project_channels (
-                project_dir TEXT PRIMARY KEY, channel_id TEXT, created_at REAL
+                project_dir TEXT PRIMARY KEY, channel_id TEXT, created_at REAL,
+                status TEXT NOT NULL DEFAULT 'ready' CHECK (status IN ('creating', 'ready')), reserved_at REAL
             );
             CREATE TABLE IF NOT EXISTS questions (
                 id TEXT PRIMARY KEY, session_id TEXT, thread_id TEXT,
@@ -152,19 +171,22 @@ class State:
                 note TEXT, sender_id TEXT, created_at REAL, delivered_at REAL,
                 confirmed_at REAL, delivered_event TEXT, delivery_pid INTEGER, delivery_owner TEXT
             );
-        ''')
-        self.db.execute('BEGIN IMMEDIATE')
-        try:
+            '''
+            for statement in schema.split(';'):
+                if statement.strip():
+                    self.db.execute(statement)
             for table, column, kind in (('inbox', 'confirmed_at', 'REAL'), ('inbox', 'delivered_event', 'TEXT'),
                                         ('inbox', 'delivery_pid', 'INTEGER'), ('inbox', 'delivery_owner', 'TEXT'),
-                                        ('host_sessions', 'last_prompt_at', 'REAL')):
+                                        ('host_sessions', 'last_prompt_at', 'REAL'),
+                                        ('project_channels', 'status', "TEXT NOT NULL DEFAULT 'ready' CHECK (status IN ('creating', 'ready'))"),
+                                        ('project_channels', 'reserved_at', 'REAL')):
                 columns = {row['name'] for row in self.db.execute('PRAGMA table_info(' + table + ')')}
                 if column not in columns:
                     self.db.execute('ALTER TABLE ' + table + ' ADD COLUMN ' + column + ' ' + kind)
+            self.db.execute('PRAGMA user_version=' + str(SCHEMA_VERSION))
             self.db.execute('COMMIT')
         except BaseException:
             self.db.execute('ROLLBACK')
-            self.db.close()
             raise
 
     def register(self, host):
@@ -183,17 +205,37 @@ class State:
         values['last_seen'] = time.time()
         self.db.execute('UPDATE sessions SET ' + ', '.join(k + '=?' for k in values) + ' WHERE id=?', (*values.values(), session_id))
 
-    def project_channel(self, project_dir, create):
-        """Serialize mapping creation across processes."""
+    def project_channel(self, project_dir, create, *, lookup=None):
+        """Reserve briefly, then reconcile/create without holding a write lock.
+
+        Failed requests leave a reservation so a later lookup can recover an
+        uncertain Discord creation after the 120-second reservation expires.
+        """
+        project_dir, now = str(project_dir), time.time()
         self.db.execute('BEGIN IMMEDIATE')
         try:
-            row = self.db.execute('SELECT channel_id FROM project_channels WHERE project_dir=?', (str(project_dir),)).fetchone()
-            if row:
-                channel_id = row['channel_id']
-            else:
-                now = time.time()
-                channel_id = create()['id']
-                self.db.execute('INSERT INTO project_channels VALUES (?, ?, ?)', (str(project_dir), channel_id, now))
+            row = self.db.execute('SELECT * FROM project_channels WHERE project_dir=?', (project_dir,)).fetchone()
+            if row and row['status'] == 'ready':
+                self.db.execute('COMMIT')
+                return row['channel_id']
+            if row and row['reserved_at'] is not None and now - row['reserved_at'] < 120:
+                raise RuntimeError('project channel creation in progress, retry shortly')
+            self.db.execute("INSERT INTO project_channels (project_dir, created_at, status, reserved_at) VALUES (?, ?, 'creating', ?) "
+                            "ON CONFLICT(project_dir) DO UPDATE SET status='creating', reserved_at=excluded.reserved_at",
+                            (project_dir, now, now))
+            self.db.execute('COMMIT')
+        except BaseException:
+            self.db.execute('ROLLBACK')
+            raise
+        channel = lookup() if lookup is not None else None
+        channel_id = (channel if channel is not None else create())['id']
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            changed = self.db.execute("UPDATE project_channels SET channel_id=?, status='ready' "
+                                      "WHERE project_dir=? AND status='creating' AND reserved_at=?",
+                                      (channel_id, project_dir, now)).rowcount
+            if not changed:
+                raise RuntimeError('Project channel reservation expired or was replaced; retry shortly')
             self.db.execute('COMMIT')
             return channel_id
         except BaseException:

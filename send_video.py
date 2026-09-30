@@ -1,9 +1,11 @@
 """Send any video, shrinking conditionally with FFmpeg; preserve the original."""
 import argparse
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 from discord_client import send, TooLarge
 
 def deliver_video(video, message, sender, limit_mib=20, ffmpeg='ffmpeg', ffprobe='ffprobe'):
@@ -21,6 +23,8 @@ def deliver_video(video, message, sender, limit_mib=20, ffmpeg='ffmpeg', ffprobe
         raise ValueError('Video duration must be positive')
     copies = source.parent / (source.stem + '_discord_copies')
     copies.mkdir(exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ_')
+    copies = Path(tempfile.mkdtemp(prefix=stamp, dir=copies))
     for height, budget, audio in [(720, 9, 96), (480, 4.5, 64), (360, 2.2, 48), (240, 1, 32)]:
         budget = min(budget, limit_mib * .85)
         bitrate = int(budget * 1024**2 * 8 * .90 / duration / 1000 - audio)
