@@ -581,6 +581,14 @@ class HookTests(unittest.TestCase):
             self.assertEqual(self.run_hook('Stop'), (0, '', ''))
         self.assertEqual(self.alert_payload(http), {'content': '✅ Turn finished after 2 min', 'allowed_mentions': {'parse': []}})
 
+    def test_idle_notifications_do_not_alert(self):
+        http = self.prepare_alert()
+        self.assertEqual(self.run_hook('Notification', message='Claude is waiting for your input'), (0, '', ''))
+        self.assertEqual(self.run_hook('Notification', message='Anything', notification_type='idle_prompt'), (0, '', ''))
+        http.assert_not_called()
+        self.run_hook('Notification', message='Claude needs your permission to use Bash')
+        http.assert_called_once()
+
     def test_failed_alert_is_visible_and_never_echoes_secrets(self):
         import urllib.error
         http = self.prepare_alert()

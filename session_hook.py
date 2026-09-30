@@ -13,6 +13,9 @@ def post_alert(host, row, payload):
     if not row['thread_id']:
         return 0
     if host == 'claude' and event == 'Notification':
+        # Idle reminders fire ~60 s after every turn; the Stop alert already covers long turns.
+        if payload.get('notification_type') == 'idle_prompt' or 'waiting for your input' in (payload.get('message') or '').lower():
+            return 0
         text = '⏳ Needs your attention: ' + (payload.get('message') or '')[:300]
     elif host == 'codex' and event == 'PermissionRequest':
         summary = (payload.get('tool_name', '') + ' ' + json.dumps(payload.get('tool_input', {}), ensure_ascii=False))[:300]

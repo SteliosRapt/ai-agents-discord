@@ -1,6 +1,6 @@
 {
   "name": "ai-agents",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Lets local Claude Code sessions post declared milestones, files and questions to the owner's 'AI Agents' Discord server, one thread per session.",
   "author": {
     "name": "Stelios Raptopoulos"
