@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ai-agents": {
+      "command": "py",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/ai_agents_mcp.py", "--host", "claude"]
+    }
+  }
+}

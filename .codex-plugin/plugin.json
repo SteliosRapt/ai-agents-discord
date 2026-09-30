@@ -1,0 +1,17 @@
+{
+  "name": "ai-agents",
+  "version": "0.1.0",
+  "description": "Lets local Codex sessions post declared milestones, files and questions to the owner's 'AI Agents' Discord server, one thread per session.",
+  "author": { "name": "Stelios Raptopoulos" },
+  "license": "UNLICENSED",
+  "keywords": ["discord", "notifications", "milestones"],
+  "skills": "./skills/",
+  "mcpServers": "./codex.mcp.json",
+  "interface": {
+    "displayName": "AI Agents",
+    "shortDescription": "Post declared task milestones to your Discord",
+    "developerName": "Stelios Raptopoulos",
+    "category": "Productivity",
+    "capabilities": ["Write"]
+  }
+}

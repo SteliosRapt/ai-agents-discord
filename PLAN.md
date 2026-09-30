@@ -1,6 +1,6 @@
 # AI Agents Discord plugin — evolution plan (proposal, 2026-09-30)
 
-Status: **proposal only, nothing implemented.** Sources: Sol second opinion (ask `0930-202129-053`) and Sol web research (full cited report: `.orc/asks/0930-202129-020.final.md`).
+Status: **Phase 1 in progress** (bot-backed MCP server + dual manifests + skill). Phase 3 remote inbox is deferred by owner decision (see Decisions). Sources: Sol second opinion (ask `0930-202129-053`) and Sol web research (full cited report: `.orc/asks/0930-202129-020.final.md`).
 
 ## Answers to the direct questions
 
@@ -80,12 +80,31 @@ AI Agents
     #<project>         auto-created per project
 ```
 
-## Decisions needed from you
+## Decisions (owner, 2026-09-30)
 
-1. Create the bot application and enable Message Content intent? (You do the portal steps and run the hidden-prompt setup; I don't handle the token.)
-2. Per-project **channels** under a category, or everything as **threads** in fewer channels?
-3. Is remote control (Discord → agents act) in scope now, or read/notify/ask only?
-4. Claude inbound: adopt the official Channels plugin, or build our own so Claude and Codex behave the same?
+1. **Bot: yes, owner-only.** You create it (Public Bot OFF so nobody else can invite it). Every inbound path checks `owner_user_id`.
+2. **Threads** (they are sub-channels: nested under a channel in the sidebar, archive when idle, reopenable). One text channel per project under the AGENTS category; one thread per agent session.
+3. **No remote control / task inbox for now.** Main purpose: notify, plus task-level milestones while an agent works, plus a Discord command to list running Claude Code/Codex sessions and send one of them a file from your phone.
+4. **Build our own, the same for Claude and Codex** (not the official Claude Channels plugin).
+- Usage restraint: agents declare *before starting* when they'll post (`start_session(plan, max_messages)`), and the server enforces that budget. Status edits don't ping the phone.
+
+## Phase 2 design: `/agents`, targeted files, explicit tagging
+
+**Who is running.** Every Claude Code/Codex session with the plugin enabled starts its own `ai_agents_mcp.py` process at session start. That process writes a registry row (host, pid, launch time) **without any model call**, so the registry costs zero tokens. A `SessionStart` hook adds the session id and working directory (both hosts pass these to hooks), matched to the MCP process by their shared parent process. Dead processes are pruned by pid check. Sessions that never call `start_session` show as "idle, no thread".
+
+**The Discord command.** A small always-on local listener (`ai_agents_daemon.py`, hidden window, started at login by Task Scheduler after you approve that) holds the only Gateway connection. It registers owner-only guild slash commands:
+- `/agents`: lists live sessions with host · project · task title · thread link · last activity, visible only to you.
+- `/send agent:<autocomplete> file:<attachment> note:<text>`: downloads the attachment into `inbox/<session>/` and reacts ✅ with the saved path.
+
+**How the agent gets it (no interruption, no wrong agent).** Nothing is pushed into a session. The targeted session sees the file at its **next tool step**: a `PostToolUse` hook checks only its own inbox folder and injects one line ("Owner sent `<file>`: `<note>`"). Other sessions never see it. Idle sessions don't wake up; the daemon says "queued, agent is idle" instead. Empty-inbox checks are a file-exists test (no tokens).
+
+**Explicit tagging rules** (agents only react to):
+1. A **Discord Reply** to the agent's own `ask_owner` question, inside its thread. This is the answer path, and works today via `check_answer`.
+2. `/send` (or @-mentioning the bot inside that agent's thread) with a file/note, delivered as above.
+
+Everything else, including plain messages in threads, other channels, and anything not from you, is ignored. Agents never read Discord on their own initiative.
+
+**Why a listener is needed:** slash commands and mentions are events. Without a Gateway connection (or a public HTTPS endpoint, which we avoid), nothing on the PC can react to `/agents`. The listener is a normal local script, not an AI wakeup, and it has no model access.
 
 ## Execution plan once approved
 

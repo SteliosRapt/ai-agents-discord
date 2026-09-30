@@ -1,0 +1,12 @@
+{
+  "name": "ai-agents-local",
+  "description": "Local marketplace for the AI Agents Discord plugin",
+  "owner": { "name": "Stelios Raptopoulos" },
+  "plugins": [
+    {
+      "name": "ai-agents",
+      "source": "./",
+      "description": "Declared milestones, files and questions to the AI Agents Discord server"
+    }
+  ]
+}
