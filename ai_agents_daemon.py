@@ -119,13 +119,18 @@ def download(attachment, handle):
     size = attachment.get('size')
     if size is not None and (type(size) is not int or size < 0):
         raise ValueError('Invalid attachment size')
-    root = agent_state.ROOT.resolve()
-    inbox = (root / 'inbox').resolve()
-    folder = (inbox / handle).resolve()
+    # Create first, then resolve strictly: on Windows a path resolves differently before and after it exists,
+    # so resolving a not-yet-created folder raced with concurrent /send calls. The handle was validated above.
+    (agent_state.ROOT / 'inbox' / handle).mkdir(parents=True, exist_ok=True)
+    root = agent_state.ROOT.resolve(strict=True)
+    inbox = (root / 'inbox').resolve(strict=True)
+    folder = (inbox / handle).resolve(strict=True)
     if not inbox.is_relative_to(root) or not folder.is_relative_to(inbox):
         raise ValueError('Inbox folder escapes the data directory')
-    folder.mkdir(parents=True, exist_ok=True)
     name = datetime.now(UTC).strftime('%Y%m%d-%H%M%S_') + safe_name(attachment.get('filename', 'file'))
+    # Reserve the final name itself with an exclusive create (an empty placeholder), so concurrent /send calls
+    # with the same file name in the same second can never pick the same destination; the finished download
+    # atomically replaces the placeholder.
     index = 0
     while True:
         base = Path(name)
@@ -134,26 +139,27 @@ def download(attachment, handle):
         part = folder / (candidate + '.part')
         if not path.is_relative_to(folder) or not part.resolve().is_relative_to(folder):
             raise ValueError('Attachment path escapes the inbox folder')
-        if path.exists():
-            index += 1
-            continue
         try:
-            stream = part.open('xb')
+            path.open('xb').close()
             break
         except FileExistsError:
             index += 1
+    done = False
     try:
-        with stream, urlopen(urllib.request.Request(url), timeout=55) as response:
+        with part.open('xb') as stream, urlopen(urllib.request.Request(url), timeout=55) as response:
             count = 0
             while chunk := response.read(65536):
                 stream.write(chunk)
                 count += len(chunk)
             if size is not None and count != size:
                 raise ValueError('Attachment size mismatch')
-        part.rename(path)
+        os.replace(part, path)
+        done = True
         return path
     finally:
         part.unlink(missing_ok=True)
+        if not done:
+            path.unlink(missing_ok=True)
 
 def project(row):
     return Path(row['cwd']).name
