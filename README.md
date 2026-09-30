@@ -121,10 +121,10 @@ Both keys are optional in `config.toml`.
 
 ```powershell
 Set-Location "$HOME\Desktop\Discord_Agent_Toolkit"
-python discord_client.py send "Task finished"
-python discord_client.py send "Here is the report" --file "C:\path\report.pdf"
-python send_video.py "C:\path\movie.mp4" --message "Animation finished"
-python run_and_notify.py --name "My job" -- python "C:\path\job.py"
+py discord_client.py send "Task finished"
+py discord_client.py send "Here is the report" --file "C:\path\report.pdf"
+py send_video.py "C:\path\movie.mp4" --message "Animation finished"
+py run_and_notify.py --name "My job" -- py "C:\path\job.py"
 ```
 
 Python 3.10+ is required. Basic messages and attachments use only the standard library. Video compression additionally needs FFmpeg (with libx264) and ffprobe on PATH; alternatively pass `--ffmpeg C:\path\ffmpeg.exe --ffprobe C:\path\ffprobe.exe`. Get FFmpeg through https://ffmpeg.org/download.html. Compression uses the source video's measured duration, preserves audio if present, and writes separate copies beside the source. No images or previews are generated for review.
