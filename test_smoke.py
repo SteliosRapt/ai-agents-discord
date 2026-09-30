@@ -56,7 +56,7 @@ class SmokeTests(unittest.TestCase):
         self.http = self.enterContext(patch.object(bot_client.urllib.request, 'urlopen', side_effect=self.request))
         self.hook_runs = []
         self.process = self.enterContext(patch.object(smoke.subprocess, 'run', side_effect=self.hook_process))
-        self.enterContext(patch.object(smoke.shutil, 'which', return_value='bash'))
+        self.enterContext(patch.object(smoke.shutil, 'which', side_effect=lambda name: name))
         self.listener = self.enterContext(patch.object(smoke, 'check_listener', return_value='lock held; Gateway ready'))
         self.mcp_runs = []
         self.session = AsyncMock()
@@ -245,8 +245,15 @@ class SmokeTests(unittest.TestCase):
             self.assertEqual(kwargs['env']['PLUGIN_ROOT'], str(smoke.REPO))
             self.assertFalse(root.exists())
 
+    def test_wsl_bash_launcher_is_rejected(self):
+        wsl = r'C:\Windows\System32\bash.exe'
+        with patch.object(smoke.shutil, 'which', side_effect=lambda name: wsl if name == 'bash' else name):
+            with self.assertRaises(smoke.CheckFailed) as caught:
+                smoke.check_hooks()
+        self.assertIn('WSL launcher', str(caught.exception))
+
     def test_claude_without_bash_uses_cmd(self):
-        with patch.object(smoke.shutil, 'which', return_value=None):
+        with patch.object(smoke.shutil, 'which', side_effect=lambda name: None if name == 'bash' else name):
             smoke.check_hooks()
         for argv, _, _, _ in self.hook_runs[:6]:
             if os.name == 'nt':

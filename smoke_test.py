@@ -93,8 +93,15 @@ def check_hook(host, event, command, timeout, shell, repo=REPO):
                               'cwd': cwd}, ensure_ascii=False).encode('utf-8')
         if host == 'claude':
             command = command.replace('${CLAUDE_PLUGIN_ROOT}', repo.as_posix())
-        argv = ([shell, '-NoProfile', '-Command', command] if shell == 'pwsh' else
-                [shell, '-c', command] if shell == 'bash' else [shell, '/c', command])
+        # Launch the PATH-resolved program: a bare 'bash' goes through CreateProcess's search order, which checks
+        # System32 first and starts the WSL launcher instead of Git Bash (what Claude Code uses on Windows).
+        program = shutil.which(shell) if shell != 'cmd' else shell
+        if program is None:
+            raise CheckFailed(f'{shell} not found on PATH')
+        if shell == 'bash' and Path(program).parent.name.lower() == 'system32':
+            raise CheckFailed('bash resolves to the WSL launcher; Claude Code uses Git Bash')
+        argv = ([program, '-NoProfile', '-Command', command] if shell == 'pwsh' else
+                [program, '-c', command] if shell == 'bash' else [shell, '/c', command])
         if shell == 'cmd' and os.name == 'nt':
             # list2cmdline escapes embedded quotes for the CRT, not cmd's parser.
             # Pass the exact shell program text without that extra quoting layer.
