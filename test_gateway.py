@@ -428,6 +428,56 @@ class GatewayTests(unittest.TestCase):
         self.assertTrue(any('ACK missing' in line for line in self.logs))
         self.assertEqual(self.stop.waits, [1])
 
+    def test_hello_timeout_closes_blackhole_after_30_seconds_and_backs_off(self):
+        first = ScriptSocket()
+        def blackhole():
+            self.clock = 29.9
+            self.assertFalse(first.closed.wait(0.15), 'HELLO wait closed before 30 seconds')
+            self.clock = 30
+            self.assertTrue(first.closed.wait(2), 'HELLO timeout did not close transport')
+            return gateway.WebSocketClosed(4000)
+        first.script = [blackhole]
+        second = ScriptSocket(HELLO, self.finish)
+        self.run_script(first, second)
+        self.assertEqual(first.sent, [])
+        self.assertTrue(all(code == 4000 for code in first.closes))
+        self.assertEqual(self.stop.waits, [1])
+        self.assertTrue(any('HELLO' in line and 'TimeoutError' in line for line in self.logs))
+
+    def test_requested_heartbeat_before_scheduled_one_gets_full_interval_to_ack(self):
+        ws = ScriptSocket()
+        premature = []
+        def request_beat():
+            self.clock = 0.49
+            return event(1)
+        def scheduled():
+            self.clock = 0.5
+            premature.append(ws.closed.wait(0.15))
+            return event(11)
+        ws.script = [HELLO, READY, request_beat, scheduled, self.finish]
+        self.run_script(ws)
+        self.assertEqual(premature, [False], 'requested heartbeat caused premature zombie')
+        self.assertEqual(ws.closes, [1000])
+        self.assertEqual(self.stop.waits, [])
+        self.assertEqual(self.logs, [])
+
+    def test_repeated_requested_heartbeats_do_not_reset_unacked_age(self):
+        first = ScriptSocket()
+        def request_beat():
+            self.clock = 0.49
+            return event(1)
+        def another_request():
+            self.clock = 0.5
+            return event(1)
+        def zombie():
+            self.clock = 1.49
+            self.assertTrue(first.closed.wait(2), 'unacked heartbeat age was reset')
+            return gateway.WebSocketClosed(4000)
+        first.script = [HELLO, READY, request_beat, another_request, zombie]
+        self.run_script(first, ScriptSocket(HELLO, self.finish))
+        self.assertEqual(self.stop.waits, [1])
+        self.assertTrue(any('ACK missing' in line for line in self.logs))
+
     def test_ack_allows_next_scheduled_heartbeat_with_latest_seq(self):
         ws = ScriptSocket()
 

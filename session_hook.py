@@ -6,6 +6,7 @@ import re
 import sys
 import time
 import agent_state
+import redaction
 
 def post_alert(host, row, payload):
     """Only linked, eligible hook events load config or the bot client."""
@@ -16,10 +17,9 @@ def post_alert(host, row, payload):
         # Idle reminders fire ~60 s after every turn; the Stop alert already covers long turns.
         if payload.get('notification_type') == 'idle_prompt' or 'waiting for your input' in (payload.get('message') or '').lower():
             return 0
-        text = '⏳ Needs your attention: ' + (payload.get('message') or '')[:300]
+        text = '⏳ Needs your attention: ' + redaction.redact(payload.get('message') or '')[:300]
     elif host == 'codex' and event == 'PermissionRequest':
-        summary = (payload.get('tool_name', '') + ' ' + json.dumps(payload.get('tool_input', {}), ensure_ascii=False))[:300]
-        text = '⏳ Codex is waiting for approval: ' + summary
+        text = '⏳ Codex is waiting for approval: ' + payload.get('tool_name', '')
     elif event == 'Stop' and row['last_prompt_at'] is not None:
         text = None
     else:
@@ -34,7 +34,7 @@ def post_alert(host, row, payload):
             text = f'✅ Turn finished after {int(minutes)} min'
             message = payload.get('last_assistant_message')
             if message:
-                text += ': ' + message[:300]
+                text += ': ' + redaction.redact(message)[:300]
         users = (config['owner_user_id'],) if config['alert_mentions_owner'] else ()
         if users:
             text = f'<@{users[0]}> ' + text
@@ -53,7 +53,7 @@ def main():
     parser.add_argument('--host', choices=['claude', 'codex'], required=True)
     args = parser.parse_args()
     try:
-        payload = json.load(sys.stdin)
+        payload = json.loads(sys.stdin.buffer.read().decode('utf-8', errors='strict'))
     except (ValueError, UnicodeError):
         print('Invalid hook input: expected one JSON object', file=sys.stderr)
         return 1

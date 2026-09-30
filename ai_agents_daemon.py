@@ -184,6 +184,7 @@ class Listener:
     def __init__(self, config, client, app_id, logger):
         self.config, self.client, self.app_id, self.log = config, client, snowflake(app_id), logger
         self.pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='discord-interaction')
+        self.download_slots = threading.BoundedSemaphore(8)
 
     def on_dispatch(self, name, data):
         if name in ('READY', 'RESUMED'):
@@ -192,7 +193,10 @@ class Listener:
         if name != 'INTERACTION_CREATE':
             return
         self.log.add_secret(data.get('token'))
-        self.pool.submit(self.handle, data).add_done_callback(self.finished)
+        try:
+            self.handle(data)
+        except Exception as error:
+            self.log(f'Interaction dispatch failed: {type(error).__name__}: {error}')
 
     def finished(self, future):
         if not future.cancelled() and future.exception() is not None:
@@ -213,10 +217,9 @@ class Listener:
         self.client.request('PATCH', f'/webhooks/{self.app_id}/{token}/messages/@original',
                             {'content': self.log.redact(content)[:2000], 'allowed_mentions': {'parse': []}}, mentions=False)
 
-    def handle(self, interaction):
+    def handle(self, interaction, *, background=True):
         self.log.add_secret(interaction.get('token'))
-        deferred = attempted = queued = False
-        path = None
+        deferred = attempted = admitted = submitted = False
 
         def callback(kind, data):
             nonlocal attempted
@@ -250,27 +253,74 @@ class Listener:
                     content = agents_text(state.live_host_sessions())
                 callback(4, {'flags': 64, 'content': self.log.redact(content)})
             elif data['name'] == 'send':
-                deferred = True
+                admitted = self.download_slots.acquire(blocking=False)
+                if not admitted:
+                    callback(4, {'flags': 64, 'content': 'Busy, try again shortly'})
+                    return
                 callback(5, {'flags': 64})
-                handle = options.get('agent', '')
-                with contextlib.closing(agent_state.State()) as state:
-                    row = next((r for r in state.live_host_sessions() if r['handle'] == handle), None)
-                    if row is None:
-                        self.edit(interaction, f'Unknown or inactive session `{handle}`. Use /agents.')
-                        return
-                    note = options.get('note', '')
-                    if not isinstance(note, str) or len(note) > 1000:
-                        raise ValueError('Note must be text of at most 1000 characters')
-                    attachment = data['resolved']['attachments'][options['file']]
-                    path = download(attachment, handle)
-                    state.add_inbox(row['host_session_id'], path, note, self.config['owner_user_id'])
-                    queued = True
-                    if row['thread_id']:
-                        content = f'📎 Owner sent `{path.name}` via /send' + (': ' + note if note else '')
-                        self.client.send_message(row['thread_id'], self.log.redact(content)[:2000])
-                    self.edit(interaction, f'Saved `{path.name}` for `{handle}` ({row["host"]} · {project(row)}). The agent sees it at its next step.')
+                deferred = True
+                if background:
+                    future = self.pool.submit(self.send_file, interaction, options)
+                    submitted = True
+                    future.add_done_callback(self.download_finished)
+                else:
+                    self.send_file(interaction, options)
             else:
                 raise ValueError('Unknown command')
+        except Exception as exc:
+            message = self.log.redact(f'Failed: {type(exc).__name__}: {exc}')
+            self.log(message)
+            try:
+                if deferred:
+                    self.edit(interaction, message)
+                elif not attempted:
+                    callback(8, {'choices': []}) if kind == 4 else callback(4, {'flags': 64, 'content': message[:2000]})
+            except Exception as error:
+                self.log(f'Cannot report interaction failure: {type(error).__name__}: {error}')
+        finally:
+            if admitted and not submitted:
+                self.download_slots.release()
+
+    def download_finished(self, future):
+        self.download_slots.release()
+        self.finished(future)
+
+    def send_file(self, interaction, options):
+        path = None
+        queued = False
+        try:
+            handle = options.get('agent', '')
+            with contextlib.closing(agent_state.State()) as state:
+                row = next((r for r in state.live_host_sessions() if r['handle'] == handle), None)
+                if row is None:
+                    self.edit(interaction, f'Unknown or inactive session `{handle}`. Use /agents.')
+                    return
+                note = options.get('note', '')
+                if not isinstance(note, str) or len(note) > 1000:
+                    raise ValueError('Note must be text of at most 1000 characters')
+                attachment = interaction['data']['resolved']['attachments'][options['file']]
+                path = download(attachment, handle)
+                state.db.execute('BEGIN IMMEDIATE')
+                try:
+                    row = state.db.execute('SELECT * FROM host_sessions WHERE host_session_id=?',
+                                           (row['host_session_id'],)).fetchone()
+                    active = (row is not None and row['ended_at'] is None and
+                              (row['host_pid'] is None or agent_state.process_alive(row['host_pid'])))
+                    if active:
+                        state.add_inbox(row['host_session_id'], path, note, self.config['owner_user_id'])
+                    state.db.execute('COMMIT')
+                    queued = active
+                except BaseException:
+                    state.db.execute('ROLLBACK')
+                    raise
+                if not queued:
+                    path.unlink(missing_ok=True)
+                    self.edit(interaction, f'Session `{handle}` ended during the download; file not queued.')
+                    return
+                if row['thread_id']:
+                    content = f'📎 Owner sent `{path.name}` via /send' + (': ' + note if note else '')
+                    self.client.send_message(row['thread_id'], self.log.redact(content)[:2000])
+                self.edit(interaction, f'Saved `{path.name}` for `{handle}` ({row["host"]} · {project(row)}). The agent sees it at its next step.')
         except Exception as exc:
             message = self.log.redact(f'Failed: {type(exc).__name__}: {exc}')
             self.log(message)
@@ -280,10 +330,7 @@ class Listener:
                 except OSError as error:
                     self.log(f'Cannot remove failed download: {type(error).__name__}: {error}')
             try:
-                if deferred:
-                    self.edit(interaction, message)
-                elif not attempted:
-                    callback(8, {'choices': []}) if kind == 4 else callback(4, {'flags': 64, 'content': message[:2000]})
+                self.edit(interaction, message)
             except Exception as error:
                 self.log(f'Cannot report interaction failure: {type(error).__name__}: {error}')
 

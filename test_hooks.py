@@ -327,9 +327,18 @@ class HookTests(unittest.TestCase):
         return self.run_input(json.dumps(payload), host)
 
     def run_input(self, text, host='claude'):
-        with patch('sys.argv', ['session_hook.py', '--host', host]), patch('sys.stdin', io.StringIO(text)), contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+        raw = text.encode('utf-8') if isinstance(text, str) else text
+        with patch('sys.argv', ['session_hook.py', '--host', host]), patch('sys.stdin', io.TextIOWrapper(io.BytesIO(raw), encoding='cp1253')), contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
             code = session_hook.main()
         return code, out.getvalue(), err.getvalue()
+
+    def test_utf8_input_ignores_console_encoding_and_rejects_invalid_bytes(self):
+        cwd = str(self.root / 'Ελληνικά 📎')
+        payload = {'session_id': 'utf8', 'hook_event_name': 'SessionStart', 'cwd': cwd}
+        self.assertEqual(self.run_input(json.dumps(payload, ensure_ascii=False)), (0, '', ''))
+        self.assertEqual(self.state.db.execute('SELECT cwd FROM host_sessions').fetchone()[0], cwd)
+        self.assertEqual(self.run_input(b'{"cwd":"\xff"}'),
+                         (1, '', 'Invalid hook input: expected one JSON object\n'))
 
     def test_inbox_exact_output_both_hosts_and_events(self):
         for host in ('claude', 'codex'):
@@ -414,7 +423,7 @@ class HookTests(unittest.TestCase):
                 imports.extend(alias.name.split('.')[0] for alias in node.names)
             elif isinstance(node, ast.ImportFrom):
                 imports.append(node.module.split('.')[0])
-        self.assertTrue(set(imports) <= sys.stdlib_module_names | {'agent_state'})
+        self.assertTrue(set(imports) <= sys.stdlib_module_names | {'agent_state', 'redaction'})
         self.assertFalse({'mcp', 'bot_client', 'discord_client'} & set(imports))
 
     def test_no_alert_path_never_imports_bot(self):
@@ -428,7 +437,7 @@ class HookTests(unittest.TestCase):
             for host in ('claude', 'codex'):
                 for event in ('SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Stop', 'SessionEnd', 'Notification', 'PermissionRequest'):
                     payload = {'session_id': 'unlinked', 'hook_event_name': event, 'cwd': str(self.root)}
-                    with patch('sys.argv', ['session_hook.py', '--host', host]), patch('sys.stdin', io.StringIO(json.dumps(payload))), contextlib.redirect_stdout(io.StringIO()) as out:
+                    with patch('sys.argv', ['session_hook.py', '--host', host]), patch('sys.stdin', io.TextIOWrapper(io.BytesIO(json.dumps(payload).encode('utf-8')), encoding='cp1253')), contextlib.redirect_stdout(io.StringIO()) as out:
                         self.assertEqual(namespace['main'](), 0)
                     self.assertEqual(out.getvalue(), '')
             row = self.state.touch_host_session('claude', 'linked', self.root, None, 'Stop')
@@ -537,12 +546,23 @@ class HookTests(unittest.TestCase):
 
     def test_codex_permission_summary_and_no_ping(self):
         http = self.prepare_alert('codex', alert_mentions_owner=False)
-        tool_input = {'command': 'x' * 400}
+        tool_input = {'command': 'https://discord.com/api/webhooks/123/synthetic-secret ' + 'M' * 24 + '.' + 'a' * 6 + '.' + 'b' * 27}
         self.assertEqual(self.run_hook('PermissionRequest', 'codex', tool_name='Bash', tool_input=tool_input), (0, '', ''))
-        summary = ('Bash ' + json.dumps(tool_input))[:300]
-        self.assertEqual(self.alert_payload(http), {'content': '⏳ Codex is waiting for approval: ' + summary,
+        self.assertEqual(self.alert_payload(http), {'content': '⏳ Codex is waiting for approval: Bash',
                                                    'allowed_mentions': {'parse': []}})
         http.assert_called_once()
+
+    def test_notification_and_stop_redact_before_truncating(self):
+        from redaction import redact
+        http = self.prepare_alert()
+        message = 'x' * 270 + ' https://discord.com/api/webhooks/123/synthetic-secret ' + 'M' * 24 + '.' + 'a' * 6 + '.' + 'b' * 27
+        self.assertEqual(self.run_hook('Notification', message=message), (0, '', ''))
+        self.assertEqual(self.alert_payload(http)['content'], '<@2> ⏳ Needs your attention: ' + redact(message)[:300])
+        with patch.object(agent_state.time, 'time', return_value=100):
+            self.run_hook('UserPromptSubmit')
+        with patch.object(agent_state.time, 'time', return_value=700):
+            self.assertEqual(self.run_hook('Stop', last_assistant_message=message), (0, '', ''))
+        self.assertEqual(self.alert_payload(http)['content'], '<@2> ✅ Turn finished after 10 min: ' + redact(message)[:300])
 
     def test_only_linked_matching_host_and_events_alert(self):
         http = self.prepare_alert()
