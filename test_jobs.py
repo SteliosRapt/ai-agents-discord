@@ -3,6 +3,7 @@ import contextlib
 from http.client import HTTPException
 import io
 import json
+import os
 from pathlib import Path
 import runpy
 import tempfile
@@ -111,8 +112,11 @@ class ImmediateThread:
     def start(self):
         self.target(*self.args)
 
-    def join(self):
+    def join(self, timeout=None):
         pass
+
+    def is_alive(self):
+        return False
 
 class JobTests(unittest.TestCase):
     def setUp(self):
@@ -124,6 +128,8 @@ class JobTests(unittest.TestCase):
         self.send = self.enterContext(patch.object(jobs, 'send', side_effect=self.post))
         self.edit = self.enterContext(patch.object(jobs, 'edit', side_effect=self.update))
         self.popen = self.enterContext(patch.object(jobs.subprocess, 'Popen'))
+        self.taskkill = self.enterContext(patch.object(jobs.subprocess, 'run'))
+        self.taskkill.return_value.returncode = 0
 
     def post(self, content, file=None):
         self.events.append(('post', content, Path(file) if file else None,
@@ -135,7 +141,7 @@ class JobTests(unittest.TestCase):
 
     def run_job(self, output='', code=0, duration=0, name='Build', every=15, log=None):
         self.process = Mock()
-        self.process.stdout = io.StringIO(output)
+        self.process.stdout = io.BytesIO(output.encode('utf-8'))
         self.process.poll.side_effect = lambda: code if self.clock() >= duration else None
         self.process.wait.return_value = code
         self.popen.return_value = self.process
@@ -153,13 +159,169 @@ class JobTests(unittest.TestCase):
         self.assertEqual(self.events[3], ('edit', '456', '✅ Build finished in 31s', 31))
         self.assertEqual(self.events[4], ('post', '✅ Build finished in 31s', None, None))
         self.popen.assert_called_once_with(['tool', '--flag'], stdout=jobs.subprocess.PIPE,
-                                          stderr=jobs.subprocess.STDOUT, text=True, errors='replace', bufsize=1)
+                                          stderr=jobs.subprocess.STDOUT, creationflags=jobs.subprocess.CREATE_NEW_PROCESS_GROUP)
         self.process.terminate.assert_not_called()
         self.assertTrue(self.process.stdout.closed)
         logs = list((self.root / 'jobs').glob('*_Build.log'))
         self.assertEqual(len(logs), 1)
         self.assertRegex(logs[0].name, r'^\d{8}T\d{12}Z_Build\.log$')
         self.assertEqual(logs[0].read_text(encoding='utf-8'), out)
+
+    def test_child_credentials_are_redacted_in_every_output_destination(self):
+        token = 'M' + 'a' * 23 + '.' + 'b' * 6 + '.' + 'c' * 27
+        webhook = 'https://discord.com/api/webhooks/123/synthetic-job-secret'
+        with patch.dict(os.environ, DISCORD_BOT_TOKEN=token, DISCORD_WEBHOOK_URL=webhook):
+            result, out, err = self.run_job(token + ' ' + webhook + '\n', code=7, duration=16)
+        self.assertEqual(result, 7)
+        log = next((self.root / 'jobs').glob('*.log')).read_text(encoding='utf-8')
+        destinations = [out, err, log, repr(self.events)]
+        for value in destinations:
+            self.assertNotIn(token, value)
+            self.assertNotIn(webhook, value)
+        self.assertEqual(out, '[redacted] [redacted]\n')
+        self.assertEqual(log, out)
+        self.assertEqual(self.events[1][2], '▶ Build running for 15s · last: [redacted] [redacted]')
+        self.assertEqual(self.events[-1][3], out)
+
+    def test_oem_bytes_and_cp1253_console_keep_complete_utf8_log(self):
+        class Console(io.StringIO):
+            encoding = 'cp1253'
+
+            def write(console, text):
+                self.assertEqual(log.read_text(encoding='utf-8'), expected)
+                text.encode(console.encoding)  # A strict redirected Greek console.
+                return super(Console, console).write(text)
+        expected = '╬ Ελληνικά\n'
+        log = self.root / 'oem.log'
+        process = Mock(stdout=io.BytesIO(expected.encode('cp737')))
+        process.poll.return_value = process.wait.return_value = 0
+        self.popen.return_value = process
+        with contextlib.redirect_stdout(Console()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            result = jobs.run_job(['tool'], 'OEM', log=log, encoding='cp737', clock=self.clock, sleep=self.clock.sleep)
+        self.assertEqual((result, err.getvalue()), (0, ''))
+        self.assertEqual(out.getvalue(), '? Ελληνικά\n')
+        self.assertEqual(log.read_bytes(), expected.encode('utf-8'))
+        self.taskkill.assert_not_called()
+
+    def test_invalid_utf8_bytes_are_replaced_without_losing_later_lines(self):
+        process = Mock(stdout=io.BytesIO(b'bad \xff\ncomplete\n'))
+        process.poll.return_value = process.wait.return_value = 0
+        self.popen.return_value = process
+        log = self.root / 'bytes.log'
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            result = jobs.run_job(['tool'], 'Bytes', log=log, clock=self.clock, sleep=self.clock.sleep)
+        self.assertEqual(result, 0)
+        self.assertEqual(out.getvalue(), 'bad �\ncomplete\n')
+        self.assertEqual(log.read_bytes(), out.getvalue().encode('utf-8'))
+
+    def test_pipe_held_by_descendant_has_bounded_drain_and_final_status(self):
+        joins, threads = [], []
+        class HeldThread(ImmediateThread):
+            def start(self):
+                threads.append(self)
+
+            def join(thread, timeout=None):
+                joins.append(timeout)
+
+            def is_alive(self):
+                return True
+        def limited_sleep(seconds):
+            Clock.sleep(self.clock, seconds)
+            if self.clock() > 11:
+                raise RuntimeError('Root exited but completion is still blocked')
+        with patch.object(jobs.threading, 'Thread', HeldThread), patch.object(self.clock, 'sleep', side_effect=limited_sleep):
+            result, _, _ = self.run_job()
+        self.assertEqual(joins, [10])
+        self.assertEqual(result, 0)
+        self.taskkill.assert_called_once_with(['taskkill', '/T', '/F', '/PID', str(self.process.pid)],
+                                              stdout=jobs.subprocess.PIPE, stderr=jobs.subprocess.STDOUT,
+                                              timeout=10, creationflags=jobs.subprocess.CREATE_NO_WINDOW)
+        self.assertIn('Output pipe still open after 10s', next((self.root / 'jobs').glob('*.log')).read_text(encoding='utf-8'))
+        self.assertEqual(self.events[-1][:2], ('post', '✅ Build finished in 0s'))
+        # Closing a pipe from another thread can itself block on its read lock.
+        self.assertFalse(self.process.stdout.closed)
+        # Once the held pipe releases, the stopped reader must not write to the
+        # already-closed log or mutate the final attachment tail.
+        self.process.stdout.write(b'late descendant output\n')
+        self.process.stdout.seek(0)
+        threads[0].target(*threads[0].args)
+        output = threads[0].args[1]
+        self.assertIsNone(output.get_nowait())
+        self.assertTrue(output.empty())
+        self.assertNotIn('late descendant output', next((self.root / 'jobs').glob('*.log')).read_text(encoding='utf-8'))
+        self.assertTrue(self.process.stdout.closed)
+
+    def test_ctrl_c_kills_tree_and_reports_final_status(self):
+        def interrupt(seconds):
+            raise KeyboardInterrupt
+        with patch.object(self.clock, 'sleep', side_effect=interrupt):
+            result, _, _ = self.run_job('working\n', duration=100)
+        self.assertEqual(result, 130)
+        self.assertEqual(self.taskkill.call_args.args[0], ['taskkill', '/T', '/F', '/PID', str(self.process.pid)])
+        self.assertEqual(self.events[-2][2], '❌ Build failed (exit 130) after 0s')
+        self.assertEqual(self.events[-1][:2], ('post', '❌ Build failed (exit 130) after 0s'))
+
+    def test_ctrl_c_during_pipe_drain_still_kills_tree_and_posts_final(self):
+        class InterruptedThread(ImmediateThread):
+            def start(self):
+                pass
+
+            def join(self, timeout=None):
+                raise KeyboardInterrupt
+
+            def is_alive(self):
+                return True
+        with patch.object(jobs.threading, 'Thread', InterruptedThread):
+            result, _, _ = self.run_job()
+        self.assertEqual(result, 130)
+        self.taskkill.assert_called_once()
+        self.assertEqual(self.events[-1][:2], ('post', '❌ Build failed (exit 130) after 0s'))
+        self.assertFalse(self.process.stdout.closed)
+
+    def test_output_reader_error_kills_tree_and_still_reports_redacted_failure(self):
+        secret = 'synthetic-reader-secret'
+        class BrokenPipe:
+            def __iter__(self):
+                raise OSError(secret)
+
+            def close(self):
+                pass
+        process = Mock(stdout=BrokenPipe())
+        process.poll.return_value = None
+        process.wait.return_value = 1
+        self.popen.return_value = process
+        with patch.dict(os.environ, DISCORD_BOT_TOKEN=secret), contextlib.redirect_stderr(io.StringIO()) as err:
+            result = jobs.run_job(['tool'], 'Build', clock=self.clock, sleep=self.clock.sleep)
+        self.assertEqual(result, 1)
+        self.taskkill.assert_called_once()
+        self.assertNotIn(secret, err.getvalue())
+        self.assertNotIn(secret, repr(self.events))
+        self.assertIn('[redacted]', self.events[-1][3])
+        self.assertEqual(self.events[-1][:2], ('post', '❌ Build failed (exit 1) after 0s'))
+
+    def test_tree_cleanup_failure_is_redacted_and_does_not_skip_final_status(self):
+        secret = 'synthetic-cleanup-secret'
+        self.taskkill.side_effect = OSError(secret)
+        with patch.dict(os.environ, DISCORD_BOT_TOKEN=secret):
+            result, _, err = self.run_job(code=7)
+        self.assertEqual(result, 7)
+        self.assertIn('Process tree cleanup failed: [redacted]', self.events[-1][3])
+        self.assertIn('Discord process tree cleanup failed: [redacted]', err)
+        self.assertNotIn(secret, err + repr(self.events))
+
+    def test_launch_error_edits_start_posts_failure_and_redacts_error(self):
+        secret = 'synthetic-inherited-job-token'
+        self.popen.side_effect = FileNotFoundError('missing executable ' + secret)
+        with patch.dict(os.environ, DISCORD_BOT_TOKEN=secret), contextlib.redirect_stderr(io.StringIO()) as err:
+            result = jobs.run_job(['missing'], 'Build', clock=self.clock, sleep=self.clock.sleep)
+        final = '❌ Build failed to start: missing executable [redacted]'
+        self.assertEqual(result, 1)
+        self.assertEqual(self.events, [('post', '▶ Build started', None, None),
+                                      ('edit', '456', final, 0), ('post', final, None, None)])
+        self.assertNotIn(secret, err.getvalue())
+        log = next((self.root / 'jobs').glob('*.log')).read_text(encoding='utf-8')
+        self.assertEqual(log, final + '\n')
+        self.taskkill.assert_not_called()
 
     def test_silent_command_still_updates_at_configured_interval(self):
         result, out, err = self.run_job(duration=46, every=20)
@@ -172,13 +334,13 @@ class JobTests(unittest.TestCase):
         out, log = io.StringIO(), io.StringIO()
         output, tail, last = jobs.queue.Queue(), jobs.deque(maxlen=60), ['']
         def lines():
-            yield 'first\n'
+            yield b'first\n'
             self.assertEqual(out.getvalue(), 'first\n')
             self.assertEqual(log.getvalue(), 'first\n')
             self.assertEqual(last[0], 'first')
-            yield ' \n'
+            yield b' \n'
             self.assertEqual(last[0], 'first')
-            yield 'second\n'
+            yield b'second\n'
         with contextlib.redirect_stdout(out):
             jobs.read_output(lines(), output, log, tail, last)
         self.assertIsNone(output.get_nowait())
@@ -259,11 +421,15 @@ class JobTests(unittest.TestCase):
         with patch.object(jobs, 'run_job', return_value=4) as run:
             self.assertEqual(jobs.main(['--name', 'Name', '--', 'tool', '--arg']), 4)
             self.assertEqual(run.call_args.args, (['tool', '--arg'], 'Name', 60, None))
+            self.assertEqual(run.call_args.kwargs['encoding'], 'utf-8')
             self.assertEqual(jobs.main(['--name', 'Name', '--every', '15', '--log', str(self.root / 'custom.log'), '--', 'tool']), 4)
             self.assertEqual(run.call_args.args, (['tool'], 'Name', 15, self.root / 'custom.log'))
+            self.assertEqual(jobs.main(['--name', 'Name', '--encoding', 'cp737', '--', 'tool']), 4)
+            self.assertEqual(run.call_args.kwargs['encoding'], 'cp737')
 
     def test_cli_rejects_short_or_invalid_interval_and_missing_command(self):
         cases = [['--name', 'Job', '--'], ['--name', 'Job']]
+        cases += [['--name', 'Job', '--encoding', 'no-such-encoding', '--', 'tool']]
         cases += [['--name', 'Job', '--every', value, '--', 'tool'] for value in ('14.9', '0', '-1', 'nan', 'inf', 'bad')]
         with patch.object(jobs, 'run_job') as run:
             for args in cases:
@@ -285,7 +451,7 @@ class JobTests(unittest.TestCase):
 
     def test_script_entrypoint_exits_with_child_code(self):
         process = Mock()
-        process.stdout = io.StringIO('child output\n')
+        process.stdout = io.BytesIO(b'child output\n')
         process.poll.return_value = process.wait.return_value = 7
         self.popen.return_value = process
         with patch.object(client, 'send', side_effect=self.post), patch.object(client, 'edit', side_effect=self.update), patch('sys.argv', ['run_and_notify.py', '--name', 'Job', '--', 'tool']), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
