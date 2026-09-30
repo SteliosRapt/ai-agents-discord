@@ -252,9 +252,9 @@ class SessionTests(unittest.TestCase):
         self.session.update_status('progress')
         self.assertEqual(self.urlopen.call_count, before + 2)
         self.assertEqual(self.http.calls[-2][0], 'POST')
-        self.assertEqual(self.session.state.session(self.session.id)['status_message_id'], first['id'])
+        self.assertEqual(self.session.state.session(self.session.id)['status_message_id'], first['message_id'])
         self.assertEqual(self.http.calls[-1][0], 'PATCH')
-        self.assertIn(first['id'], self.http.calls[-1][1])
+        self.assertIn(first['message_id'], self.http.calls[-1][1])
 
     def test_video_bot_tiers_preserve_original(self):
         self.start()
