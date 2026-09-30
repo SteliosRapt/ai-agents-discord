@@ -7,7 +7,9 @@ import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 import urllib.error
@@ -274,7 +276,7 @@ class SessionTests(unittest.TestCase):
         with patch.object(send_video.shutil, 'which', return_value='tool'), patch.object(send_video.subprocess, 'check_output', return_value=b'{"format":{"duration":"36"}}'), patch.object(send_video.subprocess, 'run', side_effect=encode):
             self.session.send_video(str(source), 'Video ready')
         self.assertEqual(source.read_bytes(), b'original')
-        self.assertTrue((self.uploads / 'video_discord_copies' / 'video_720p.mp4').is_file())
+        self.assertEqual(len(list((self.uploads / 'video_discord_copies').glob('*/video_720p.mp4'))), 1)
         self.assertIn(b'720p', self.http.calls[-1][3].data)
         self.assertIn(self.session.state.session(self.session.id)['thread_id'], self.http.calls[-1][1])
         self.assertEqual(self.urlopen.call_count, before + 2)
@@ -294,7 +296,7 @@ class SessionTests(unittest.TestCase):
         self.assertEqual([m['id'] for m in answer['answer']['messages']], [str(int(question_id) + 2), str(int(question_id) + 3)])
         self.assertTrue(all(m['is_owner'] for m in answer['answer']['messages']))
         self.assertEqual(self.session.state.db.execute('SELECT answered_message_id FROM questions WHERE id=?', (question_id,)).fetchone()[0], str(int(question_id) + 2))
-        self.assertIn('after=' + question_id, self.http.calls[-1][3].full_url)
+        self.assertTrue(any('after=' + question_id in call[3].full_url for call in self.http.calls))
         self.assert_no_http(lambda: self.session.check_answer(question_id, 51), ValueError)
         self.assert_no_http(lambda: self.session.check_answer('not-owned'), ValueError)
 
@@ -304,6 +306,228 @@ class SessionTests(unittest.TestCase):
         self.session.config['upload_roots'] = [self.root.parent]
         self.assert_no_http(lambda: self.session.post_milestone('x', [str(self.root / 'notes.txt')]), ValueError)
         self.assert_no_http(lambda: self.session.post_milestone('x', [str(self.root / 'config.toml')]), ValueError)
+
+    def test_extended_paths_use_the_same_upload_boundaries(self):
+        self.start()
+        allowed = self.uploads / 'allowed.txt'
+        allowed.write_bytes(b'allowed')
+        outside = self.uploads.parent / 'outside.txt'
+        outside.write_bytes(b'outside')
+        toolkit = Path(agents.__file__).resolve().parent
+        def extended(path):
+            return '\\\\?\\' + str(path)
+        self.session.config['upload_roots'] = [extended(toolkit.parent), extended(self.uploads.parent)]
+        for path in (toolkit / 'ai_agents_mcp.py', self.root / 'config.toml'):
+            self.assert_no_http(lambda: self.session.post_milestone('x', [extended(path)]), ValueError)
+            self.assert_no_http(lambda: self.session.send_video(extended(path), 'x'), ValueError)
+        self.session.data = Path(extended(self.root))
+        with patch.object(agents, 'TOOLKIT', Path(extended(toolkit))):
+            for path in (toolkit / 'ai_agents_mcp.py', self.root / 'config.toml'):
+                self.assert_no_http(lambda: self.session.post_milestone('x', [str(path)]), ValueError)
+        self.session.config['upload_roots'] = [extended(self.uploads)]
+        self.assert_no_http(lambda: self.session.post_milestone('x', [extended(outside)]), ValueError)
+        self.session.post_milestone('allowed', [extended(allowed)])
+        self.assertIn(b'allowed', self.http.calls[-1][3].data)
+
+    def test_extended_unc_paths_use_the_same_upload_boundaries(self):
+        self.start()
+        # Mock realpath/file reads: no access to a real network share.
+        toolkit = Path(r'\\server\share\toolkit')
+        self.session.data = Path(r'\\server\share\data')
+        self.session.config['upload_roots'] = [r'\\?\UNC\server\share\uploads', r'\\?\UNC\server\share\toolkit',
+                                               r'\\?\UNC\server\share\data']
+        with patch.object(agents, 'TOOLKIT', toolkit), patch.object(os.path, 'realpath', side_effect=lambda p, **kwargs: os.fspath(p)), \
+                patch.object(Path, 'is_file', return_value=True), patch.object(Path, 'read_bytes', return_value=b'allowed'):
+            for path in (r'\\?\UNC\server\share\toolkit\ai_agents_mcp.py', r'\\?\UNC\server\share\data\config.toml',
+                         r'\\?\UNC\server\share\outside\file.txt'):
+                self.assert_no_http(lambda: self.session.post_milestone('x', [path]), ValueError)
+                self.assert_no_http(lambda: self.session.send_video(path, 'x'), ValueError)
+            self.session.post_milestone('allowed', [r'\\?\UNC\server\share\uploads\file.txt'])
+        self.assertIn(b'allowed', self.http.calls[-1][3].data)
+
+    def test_owner_replies_to_other_messages_are_ignored(self):
+        self.start()
+        question = self.session.ask_owner('Question?')['question_id']
+        self.http.history = [message(int(question) + 1, reply='99')]
+        self.assertFalse(self.session.check_answer(question)['answered'])
+        self.http.history += [message(int(question) + 2), message(int(question) + 3, reply=question)]
+        self.assertEqual([m['id'] for m in self.session.check_answer(question)['answer']['messages']],
+                         [str(int(question) + 2), str(int(question) + 3)])
+
+    def test_answer_paginates_to_end_or_next_question(self):
+        self.start()
+        question = self.session.ask_owner('Question?')['question_id']
+        first = [message(int(question) + i, '7') for i in range(1, 101)]
+        second = [message(int(question) + 101), message(int(question) + 102, reply='99')]
+        for boundary in (None, int(question) + 102):
+            with self.subTest(boundary=boundary):
+                if boundary is not None:
+                    self.session.state.db.execute('INSERT INTO questions VALUES (?, ?, ?, ?, NULL)',
+                                                  (str(boundary), self.session.id, 'thread', 0))
+                pages = [list(reversed(first)), list(reversed(second)), []]
+                with patch.object(self.session.client, 'get_messages', side_effect=pages) as get:
+                    answer = self.session.check_answer(question)
+                self.assertEqual([m['id'] for m in answer['answer']['messages']], [str(int(question) + 101)])
+                self.assertEqual([c.kwargs['after'] for c in get.call_args_list],
+                                 [question, str(int(question) + 100)] if boundary else
+                                 [question, str(int(question) + 100), str(int(question) + 102)])
+
+    def test_channel_creation_does_not_lock_other_state_writers(self):
+        original = self.session.client.create_text_channel
+        original_lookup = self.session.client.list_guild_channels
+        def lookup_channels():
+            self.assertFalse(self.session.state.db.in_transaction)
+            return original_lookup()
+        def create(*args):
+            self.assertFalse(self.session.state.db.in_transaction)
+            other = agent_state.State(self.root)
+            try:
+                other.db.execute('PRAGMA busy_timeout=100')
+                other.touch_host_session('codex', 'parallel-hook', self.project, None, 'SessionStart')
+                with self.assertRaisesRegex(RuntimeError, 'project channel creation in progress, retry shortly'):
+                    other.project_channel(self.project.resolve(), Mock(side_effect=AssertionError('duplicate')))
+            finally:
+                other.close()
+            return original(*args)
+        with patch.object(self.session.client, 'create_text_channel', side_effect=create), \
+                patch.object(self.session.client, 'list_guild_channels', side_effect=lookup_channels) as lookup:
+            self.start()
+        lookup.assert_called_once()
+
+    def test_uncertain_channel_creation_is_reconciled_after_reservation_expires(self):
+        original = self.session.client.create_text_channel
+        now = agent_state.time.time()
+        def uncertain(*args):
+            original(*args)
+            raise RuntimeError('delivery uncertain')
+        with patch.object(agent_state.time, 'time', return_value=now), \
+                patch.object(self.session.client, 'create_text_channel', side_effect=uncertain):
+            with self.assertRaisesRegex(RuntimeError, 'delivery uncertain'):
+                self.start()
+        row = self.session.state.db.execute('SELECT * FROM project_channels').fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row['status'], 'creating')
+        with patch.object(agent_state.time, 'time', return_value=now + 119):
+            _, retry = agents.create_server('codex', self.root)
+            self.addCleanup(retry.close)
+            self.assert_no_http(lambda: self.start(retry), RuntimeError)
+        with patch.object(agent_state.time, 'time', return_value=now + 120):
+            _, retry = agents.create_server('codex', self.root)
+            self.addCleanup(retry.close)
+            result = self.start(retry)
+        self.assertEqual(result['channel_id'], self.http.channels[0]['id'])
+        self.assertEqual(len([c for c in self.http.calls if c[0] == 'POST' and c[1] == '/guilds/1/channels']), 1)
+        self.assertEqual(self.session.state.db.execute('SELECT status FROM project_channels').fetchone()[0], 'ready')
+
+    def test_channel_lookup_only_adopts_matching_text_channel_in_category(self):
+        self.http.channels = [{'id': '101', 'name': 'my-project', 'type': 0, 'parent_id': '88'},
+                              {'id': '102', 'name': 'my-project', 'type': 2, 'parent_id': '3'},
+                              {'id': '103', 'name': 'other', 'type': 0, 'parent_id': '3'},
+                              {'id': '104', 'name': 'my-project', 'type': 0, 'parent_id': '3'}]
+        self.assertEqual(self.start()['channel_id'], '104')
+        self.assertFalse(any(c[0] == 'POST' and c[1] == '/guilds/1/channels' for c in self.http.calls))
+
+    def test_mcp_tools_are_async_and_leave_event_loop_responsive(self):
+        async def exercise():
+            tools = self.server._tool_manager.list_tools()
+            self.assertTrue(all(tool.is_async for tool in tools))
+            started, release = threading.Event(), threading.Event()
+            loop_thread = threading.get_ident()
+            workers = []
+            def slow():
+                workers.append(threading.get_ident())
+                started.set()
+                if not release.wait(5):
+                    raise RuntimeError('worker was not released')
+                return []
+            async def invoke():
+                await self.server.call_tool('list_channels', {})
+            with patch.object(self.session.client, 'list_guild_channels', side_effect=slow):
+                async with anyio.create_task_group() as group:
+                    group.start_soon(invoke)
+                    try:
+                        self.assertTrue(await anyio.to_thread.run_sync(started.wait, 2))
+                        self.assertNotEqual(workers, [loop_thread])
+                    finally:
+                        release.set()
+        anyio.run(exercise)
+
+    def test_cancelled_mcp_video_does_not_upload_after_encoding(self):
+        self.start()
+        source = self.uploads / 'video.mp4'
+        source.write_bytes(b'original')
+        started, release, finished = threading.Event(), threading.Event(), threading.Event()
+        worker_errors = []
+        original_deliver = agents.deliver_video
+        def deliver(*args):
+            try:
+                return original_deliver(*args)
+            except Exception as exc:
+                worker_errors.append(str(exc))
+                raise
+            finally:
+                finished.set()
+        def encode(args, **kwargs):
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError('encoding was not released')
+            Path(args[-1]).write_bytes(b'compressed')
+        async def exercise():
+            tool = self.server._tool_manager.get_tool('send_video')
+            self.assertTrue(tool.is_async)
+            cancelled = anyio.Event()
+            scopes = []
+            async def invoke():
+                with anyio.CancelScope() as scope:
+                    scopes.append(scope)
+                    try:
+                        await self.server.call_tool('send_video', {'path': str(source), 'text': 'video'})
+                    finally:
+                        cancelled.set()
+            async with anyio.create_task_group() as group:
+                group.start_soon(invoke)
+                try:
+                    self.assertTrue(await anyio.to_thread.run_sync(started.wait, 2))
+                    scopes[0].cancel()
+                    with anyio.fail_after(2):
+                        await cancelled.wait()
+                finally:
+                    release.set()
+                self.assertTrue(await anyio.to_thread.run_sync(finished.wait, 2))
+        with patch.object(self.session.client, 'send_message', side_effect=discord_client.TooLarge) as post, \
+                patch.object(agents, 'deliver_video', side_effect=deliver), \
+                patch.object(send_video.shutil, 'which', return_value='tool'), \
+                patch.object(send_video.subprocess, 'check_output', return_value=b'{"format":{"duration":"36"}}'), \
+                patch.object(send_video.subprocess, 'run', side_effect=encode):
+            anyio.run(exercise)
+        post.assert_called_once()
+        self.assertTrue(any('cancelled' in error.lower() for error in worker_errors))
+        self.assertEqual(source.read_bytes(), b'original')
+
+    def test_attachment_cancellation_during_rate_limit_backoff_prevents_retry(self):
+        self.start()
+        source = self.uploads / 'video.mp4'
+        source.write_bytes(b'original')
+        for tool in ('send_video', 'post_milestone'):
+            with self.subTest(tool=tool):
+                cancelled = threading.Event()
+                token = agents.CALL_CANCELLED.set(cancelled)
+                rate_error = urllib.error.HTTPError('offline', 429, '', {}, io.BytesIO(b'{"retry_after":0.25}'))
+                try:
+                    with patch.object(bot.urllib.request, 'urlopen', side_effect=[rate_error, io.BytesIO(b'{"id":"ok"}')]) as http, \
+                            patch.object(bot.time, 'sleep', side_effect=lambda delay: cancelled.set()) as sleep:
+                        with self.assertRaisesRegex(RuntimeError, 'cancelled'):
+                            if tool == 'send_video':
+                                self.session.send_video(str(source), 'video')
+                            else:
+                                self.session.post_milestone('milestone', [str(source)])
+                        http.assert_called_once()
+                        self.assertEqual(http.call_args.args[0].get_method(), 'POST')
+                        self.assertIn(b'name="files[0]"', http.call_args.args[0].data)
+                        sleep.assert_called_once_with(.25)
+                finally:
+                    agents.CALL_CANCELLED.reset(token)
+        self.assertEqual(source.read_bytes(), b'original')
 
     def test_answer_window_ends_at_next_question(self):
         self.start()
@@ -368,6 +592,75 @@ class SessionTests(unittest.TestCase):
                 posted = await client.call_tool('post_milestone', {'text': 'SDK milestone'})
                 self.assertFalse(posted.isError)
         anyio.run(exercise)
+
+class StateSchemaTests(unittest.TestCase):
+    def test_old_project_mapping_migrates_to_ready(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = sqlite3.connect(Path(directory) / 'state.db')
+            db.execute('CREATE TABLE project_channels (project_dir TEXT PRIMARY KEY, channel_id TEXT, created_at REAL)')
+            db.execute("INSERT INTO project_channels VALUES ('project', '100', 1)")
+            db.commit()
+            db.close()
+            state = agent_state.State(directory)
+            try:
+                row = state.db.execute('SELECT * FROM project_channels').fetchone()
+                self.assertEqual(row['status'], 'ready')
+                self.assertEqual(row['channel_id'], '100')
+                self.assertEqual(state.project_channel('project', Mock(side_effect=AssertionError('must reuse'))), '100')
+                self.assertGreater(state.db.execute('PRAGMA user_version').fetchone()[0], 0)
+            finally:
+                state.close()
+
+    def test_up_to_date_open_uses_no_ddl_or_write_transaction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = agent_state.State(directory)
+            state.close()
+            statements = []
+            connect = sqlite3.connect
+            def traced(*args, **kwargs):
+                db = connect(*args, **kwargs)
+                db.set_trace_callback(statements.append)
+                return db
+            with patch.object(agent_state.sqlite3, 'connect', side_effect=traced):
+                state = agent_state.State(directory)
+                state.close()
+            self.assertTrue(any('USER_VERSION' in sql.upper() for sql in statements))
+            self.assertFalse(any(sql.lstrip().upper().startswith(('CREATE ', 'ALTER ', 'BEGIN ', 'PRAGMA USER_VERSION='))
+                                 for sql in statements), statements)
+
+    def test_hook_can_open_and_touch_while_channel_creation_is_in_flight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = agent_state.State(directory)
+            started, release, finished = threading.Event(), threading.Event(), threading.Event()
+            errors = []
+            def create():
+                started.set()
+                if not release.wait(5):
+                    raise RuntimeError('creation was not released')
+                return {'id': '100'}
+            def reserve():
+                try:
+                    state.project_channel('project', create)
+                except Exception as exc:
+                    errors.append(exc)
+                finally:
+                    finished.set()
+            worker = threading.Thread(target=reserve)
+            worker.start()
+            try:
+                self.assertTrue(started.wait(2))
+                other = agent_state.State(directory)
+                try:
+                    other.touch_host_session('codex', 'hook', directory, None, 'SessionStart')
+                    self.assertFalse(finished.is_set())
+                finally:
+                    other.close()
+            finally:
+                release.set()
+                worker.join(6)
+                state.close()
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
 
 class ClientTests(unittest.TestCase):
     def setUp(self):
@@ -478,6 +771,31 @@ class ClientTests(unittest.TestCase):
                 self.client.send_message('1', 'x')
             self.assertEqual(http.call_count, 5)
             self.assertEqual(sleep.call_count, 4)
+
+    def test_cancellation_is_checked_before_first_http_attempt(self):
+        for kind in ('event', 'callable'):
+            for users in ((), ('2',)):
+                with self.subTest(kind=kind, users=users):
+                    event = threading.Event()
+                    event.set()
+                    cancelled = event if kind == 'event' else event.is_set
+                    with patch.object(bot.urllib.request, 'urlopen') as http:
+                        with self.assertRaisesRegex(RuntimeError, 'cancelled'):
+                            self.client.send_message('1', 'x', mention_users=users, cancelled=cancelled)
+                        http.assert_not_called()
+
+    def test_request_cancellation_during_rate_limit_backoff_prevents_retry(self):
+        for kind in ('event', 'callable'):
+            with self.subTest(kind=kind):
+                event = threading.Event()
+                cancelled = event if kind == 'event' else event.is_set
+                rate_error = urllib.error.HTTPError('offline', 429, '', {}, io.BytesIO(b'{"retry_after":0.25}'))
+                with patch.object(bot.urllib.request, 'urlopen', side_effect=[rate_error, io.BytesIO(b'{"id":"ok"}')]) as http, \
+                        patch.object(bot.time, 'sleep', side_effect=lambda delay: event.set()) as sleep:
+                    with self.assertRaisesRegex(RuntimeError, 'cancelled'):
+                        self.client.request('POST', '/channels/1/messages', {'content': 'x'}, cancelled=cancelled)
+                    http.assert_called_once()
+                    sleep.assert_called_once_with(.25)
 
     def test_doctor_offline(self):
         with tempfile.TemporaryDirectory() as d:

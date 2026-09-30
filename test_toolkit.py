@@ -1,8 +1,10 @@
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 from http.client import HTTPException, BadStatusLine
 import io
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -74,5 +76,33 @@ class Tests(unittest.TestCase):
                 send_video.main()
             self.assertIn('240p', descriptions[-1])
             self.assertEqual(p.read_bytes(), b'original')
+
+    def test_concurrent_video_sends_have_exclusive_output_folders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sources = [Path(directory) / 'video.mp4', Path(directory) / 'video.mov']
+            for source in sources:
+                source.write_bytes(b'original')
+            barrier = threading.Barrier(3)
+            outputs = []
+            def post(message, path, limit):
+                if path in sources:
+                    raise client.TooLarge()
+                self.assertEqual(path.read_bytes(), b'compressed')
+                return {'id': 'ok'}
+            def encode(args, **kwargs):
+                output = Path(args[-1])
+                outputs.append(output)
+                barrier.wait(timeout=5)
+                output.write_bytes(b'compressed')
+            with patch.object(send_video.shutil, 'which', return_value='tool'), \
+                    patch.object(send_video.subprocess, 'check_output', return_value=b'{"format":{"duration":"36"}}'), \
+                    patch.object(send_video.subprocess, 'run', side_effect=encode), ThreadPoolExecutor(max_workers=3) as pool:
+                futures = [pool.submit(send_video.deliver_video, source, 'video', post)
+                           for source in (sources[0], sources[1], sources[0])]
+                self.assertEqual([future.result(timeout=10) for future in futures], [{'id': 'ok'}] * 3)
+            self.assertEqual(len({output.parent for output in outputs}), 3)
+            self.assertTrue(all(output.parent.parent.name == 'video_discord_copies' for output in outputs))
+            self.assertTrue(all((output.parent / 'encoding.log').is_file() for output in outputs))
+            self.assertTrue(all(source.read_bytes() == b'original' for source in sources))
 
 if __name__ == '__main__': unittest.main()
