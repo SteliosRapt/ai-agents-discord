@@ -290,6 +290,7 @@ class StateTests(unittest.TestCase):
                     INSERT INTO questions VALUES ('question', 'old', '101', 2, NULL);
                 ''')
                 schema = db.execute("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
+                project_columns = db.execute('PRAGMA table_info(project_channels)').fetchall()
             state = agent_state.State(root)
             try:
                 self.assertEqual(state.session('old')['title'], 'Existing')
@@ -303,7 +304,15 @@ class StateTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'Invalid session field'):
                     state.update(registered, handle='bad')
                 for name, sql in schema:
-                    self.assertEqual(state.db.execute('SELECT sql FROM sqlite_master WHERE name=?', (name,)).fetchone()[0], sql)
+                    if name != 'project_channels':
+                        self.assertEqual(state.db.execute('SELECT sql FROM sqlite_master WHERE name=?', (name,)).fetchone()[0], sql)
+                migrated_columns = [tuple(row) for row in state.db.execute('PRAGMA table_info(project_channels)')]
+                self.assertEqual(migrated_columns[:len(project_columns)], project_columns)
+                self.assertEqual([column[1] for column in migrated_columns[len(project_columns):]], ['status', 'reserved_at'])
+                project = state.db.execute("SELECT * FROM project_channels WHERE project_dir='project'").fetchone()
+                self.assertEqual((project['channel_id'], project['created_at'], project['status'], project['reserved_at']),
+                                 ('100', 1, 'ready', None))
+                self.assertEqual(state.db.execute('PRAGMA user_version').fetchone()[0], agent_state.SCHEMA_VERSION)
                 tables = {row[0] for row in state.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 self.assertTrue({'host_sessions', 'inbox'} <= tables)
                 self.assertEqual([row[1] for row in state.db.execute('PRAGMA table_info(host_sessions)')],
