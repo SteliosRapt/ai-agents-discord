@@ -221,12 +221,12 @@ class AgentSession:
             question = self.state.db.execute('SELECT * FROM questions WHERE id=? AND session_id=?', (question_id, self.id)).fetchone()
             if not question:
                 raise ValueError('Question does not belong to this session')
+        def next_question():
+            later = [int(q[0]) for q in self.state.db.execute('SELECT id FROM questions WHERE session_id=?', (self.id,)) if int(q[0]) > int(question_id)]
+            return min(later) if later else None
         while True:
-            # Recomputed on every poll: ask_owner can run concurrently (async tools) and a newer question
-            # ends this question's answer window.
             with self.lock:
-                later = [int(q[0]) for q in self.state.db.execute('SELECT id FROM questions WHERE session_id=?', (self.id,)) if int(q[0]) > int(question_id)]
-            end = min(later) if later else None
+                end = next_question()  # page-fetch bound only; the answer filter re-reads it below
             messages, cursor = [], question_id
             while True:
                 page = self.client.get_messages(row['thread_id'], after=cursor)
@@ -237,16 +237,20 @@ class AgentSession:
                 cursor = str(max(int(m['id']) for m in page))
                 if end is not None and int(cursor) >= end:
                     break
-            answers = sorted((m for m in messages
-                              if m.get('author', {}).get('id') == self.config['owner_user_id']
-                              and (not m.get('message_reference')
-                                   or m['message_reference'].get('message_id') == question_id)
-                              and int(m['id']) > int(question_id) and (end is None or int(m['id']) < end)),
-                             key=lambda m: int(m['id']))
-            if answers:
-                with self.lock:
+            # ask_owner can run concurrently (async tools) and holds the lock across posting and recording its
+            # question, so re-reading the boundary under the lock after fetching sees any question that
+            # preceded a fetched answer; filtering and recording stay in the same critical section.
+            with self.lock:
+                end = next_question()
+                answers = sorted((m for m in messages
+                                  if m.get('author', {}).get('id') == self.config['owner_user_id']
+                                  and (not m.get('message_reference')
+                                       or m['message_reference'].get('message_id') == question_id)
+                                  and int(m['id']) > int(question_id) and (end is None or int(m['id']) < end)),
+                                 key=lambda m: int(m['id']))
+                if answers:
                     self.state.db.execute('UPDATE questions SET answered_message_id=? WHERE id=?', (answers[0]['id'], question_id))
-                return {'answered': True, 'answer': {'note': NOTE, 'messages': [self.message_data(m) for m in answers]}}
+                    return {'answered': True, 'answer': {'note': NOTE, 'messages': [self.message_data(m) for m in answers]}}
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return {'answered': False, 'answer': None}

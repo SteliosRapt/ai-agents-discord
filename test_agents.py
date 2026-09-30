@@ -548,6 +548,29 @@ class SessionTests(unittest.TestCase):
         with patch.object(agents.time, 'monotonic', side_effect=[0, 0, 10]), patch.object(agents.time, 'sleep', side_effect=ask_while_waiting):
             self.assertFalse(self.session.check_answer(first, 10)['answered'])
 
+    def test_answer_window_tracks_question_asked_during_fetch(self):
+        self.start()
+        first = self.session.ask_owner('First?')['question_id']
+        fetching, asked = threading.Event(), threading.Event()
+        real = self.session.client.get_messages
+        def blocking_fetch(*args, **kwargs):
+            fetching.set()
+            self.assertTrue(asked.wait(5))
+            return real(*args, **kwargs)
+        def ask():
+            # Runs on another worker while check_answer is blocked inside its Discord fetch.
+            self.assertTrue(fetching.wait(5))
+            second = self.session.ask_owner('Second?')['question_id']
+            self.http.history = [message(int(second) + 1, '2', None, 'for second')]
+            asked.set()
+        worker = threading.Thread(target=ask)
+        worker.start()
+        with patch.object(self.session.client, 'get_messages', side_effect=blocking_fetch):
+            result = self.session.check_answer(first)
+        worker.join(5)
+        self.assertFalse(result['answered'])
+        self.assertIsNone(self.session.state.db.execute('SELECT answered_message_id FROM questions WHERE id=?', (first,)).fetchone()[0])
+
     def test_answer_poll_interval(self):
         self.start()
         question_id = self.session.ask_owner('Question?')['question_id']
