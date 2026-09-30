@@ -47,6 +47,30 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "py -c \"import os,runpy,sys;r=os.environ['PLUGIN_ROOT'];sys.path.insert(0,r);runpy.run_path(os.path.join(r,'session_hook.py'),run_name='__main__')\" --host codex",
+            "command_windows": "py -c \"import os,runpy,sys;r=os.environ['PLUGIN_ROOT'];sys.path.insert(0,r);runpy.run_path(os.path.join(r,'session_hook.py'),run_name='__main__')\" --host codex",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "py -c \"import os,runpy,sys;r=os.environ['PLUGIN_ROOT'];sys.path.insert(0,r);runpy.run_path(os.path.join(r,'session_hook.py'),run_name='__main__')\" --host codex",
+            "command_windows": "py -c \"import os,runpy,sys;r=os.environ['PLUGIN_ROOT'];sys.path.insert(0,r);runpy.run_path(os.path.join(r,'session_hook.py'),run_name='__main__')\" --host codex",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }

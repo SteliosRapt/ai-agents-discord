@@ -43,6 +43,28 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "py \"${CLAUDE_PLUGIN_ROOT}/session_hook.py\" --host claude",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "py \"${CLAUDE_PLUGIN_ROOT}/session_hook.py\" --host claude",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }
