@@ -1,8 +1,70 @@
-# NotifAIcations Discord toolkit
+# AI Agents Discord toolkit and plugin
 
-Standalone Python scripts for any project. No Blender scene, render folder, Codex API, bot token, or AI polling required. The local encrypted webhook is configured for the existing NotifAIcations / #general destination. This is an incoming webhook: it sends messages and attachments, but cannot read channel history or direct-message users.
+Two independent paths into the **AI Agents** Discord server:
 
-## Quick start (PowerShell)
+- **Plugin (bot):** a local MCP server (`ai_agents_mcp.py`) that Claude Code and Codex sessions use to post declared milestones, files and videos into their own thread, ask the owner a question, and read allowed channels.
+- **Webhook scripts:** standard-library scripts that post to #general (`discord_client.py`, `send_video.py`, `run_and_notify.py`). They need no bot and no model; use them from your own scripts.
+
+Neither path falls back to the other.
+
+## Plugin (Claude Code + Codex)
+
+### One-time setup
+1. **Discord:**
+   - Create a private bot (Public Bot off, Install Link = None) with the **Message Content** intent.
+   - Invite it with `bot` + `applications.commands` and View Channels, Send Messages, Send Messages in Threads, Create Public Threads, Read Message History, Attach Files, Embed Links and Add Reactions.
+   - Grant its role **Manage Channels on the AGENTS category only**.
+2. **Config:** copy `config.example.toml` to `config.toml` (gitignored) and fill in the server, owner, AGENTS-category and read-channel IDs plus `upload_roots`.
+3. **Token:** run `py bot_client.py setup` and paste the token at the hidden prompt. It is stored DPAPI-encrypted in `bot_token.dpapi` (gitignored) and only decrypts under this Windows account. `DISCORD_BOT_TOKEN` in the environment overrides it.
+4. **Check:** run `py bot_client.py doctor`. It makes read-only requests and never prints the token.
+5. **Python:** `mcp` (see `requirements.txt`) must be importable by `py` for the account that runs Claude Code/Codex.
+
+### Install
+Both manifests live in this folder: `.claude-plugin/` and `.mcp.json` for Claude; `.codex-plugin/`, `codex.mcp.json` and `.agents/plugins/marketplace.json` for Codex. The skill in `skills/discord/` is shared.
+
+```text
+claude plugin marketplace add C:\Users\user\Desktop\Discord_Agent_Toolkit
+claude plugin install ai-agents@ai-agents-local
+codex plugin marketplace add C:\Users\user\Desktop\Discord_Agent_Toolkit
+codex plugin add ai-agents@ai-agents-local
+```
+
+Restart the app afterwards. Each session then starts its own `ai_agents_mcp.py --host claude|codex` process. That process registers itself in `state.db` without any model call; list live sessions with `py agent_state.py sessions`.
+
+### How agents use it
+Behaviour is guided by `skills/discord/SKILL.md` rather than enforced quotas:
+- An agent uses Discord only for long-running work or when asked.
+- It tells you in chat when it will post, then calls `start_session(title, plan, project_dir)`.
+- That creates a channel for the project under AGENTS (once per project folder) and a thread for the session. The plan is posted first.
+
+| Tool | What it does |
+|---|---|
+| `update_status` | Edits one status message in place (no phone ping) |
+| `post_milestone` | Text plus up to 10 files |
+| `send_video` | Conditional compression; the original is kept |
+| `ask_owner` / `check_answer` | A question and its answer |
+| `read_messages`, `list_channels` | Reading |
+| `end_session` | Final summary |
+
+**Answering a question:** post anything in that agent's thread after the question. Only your user ID counts, only in that thread, and only until the agent's next question. Answers reach the agent as untrusted data.
+
+**Safety:**
+- Uploads must resolve inside `upload_roots`. Files in this toolkit folder and any `*.dpapi` file are always refused.
+- Agents can read only their own thread, their project channel and `read_channel_ids`.
+- There are no delete, moderation or role tools, and mentions are disabled.
+- Caveat: DPAPI protects the token from other Windows accounts, not from code running as you. The bot's Discord permissions are the real boundary.
+
+### Tested
+- **Offline:** `py test_toolkit.py`, `py test_agents.py`.
+- **Live, 2026-09-30:** one end-to-end run through the stdio MCP server against the real server:
+  - channel, thread, status edits, attachment, question
+  - owner answer detected in the thread
+  - read, list, final summary
+- **Not yet tested live:**
+  - `send_video` transcoding
+  - installation through the Claude/Codex plugin managers, including whether Codex resolves `py`, the environment allowlist in `codex.mcp.json`, and DPAPI under Codex
+
+## Webhook quick start (PowerShell)
 
 ```powershell
 Set-Location "$HOME\Desktop\Discord_Agent_Toolkit"
