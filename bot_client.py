@@ -46,9 +46,9 @@ class BotClient:
     def __init__(self, guild_id):
         self.guild_id = snowflake(guild_id)
 
-    def request(self, method, path, payload=None, files=()):
+    def request(self, method, path, payload=None, files=(), *, mentions=True):
         """Make one REST request, retrying only explicit rate limits."""
-        if payload is not None:
+        if payload is not None and mentions:
             payload = dict(payload)
             if 'content' in payload:
                 check_content(payload['content'])
