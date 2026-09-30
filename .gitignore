@@ -1,0 +1,9 @@
+webhook.dpapi
+__pycache__/
+*.log
+*_discord_copies/
+*.dpapi
+config.toml
+state.db
+state.db-*
+inbox/
