@@ -29,6 +29,11 @@ codex plugin marketplace add C:\Users\user\Desktop\Discord_Agent_Toolkit
 codex plugin add ai-agents@ai-agents-local
 ```
 
+**How each app runs it (observed 2026-09-30):**
+- **Claude Code** runs a local-folder plugin **in place** from this folder. Code changes apply when a session restarts.
+- **Codex** runs a **copy** from `~/.codex/plugins/cache/ai-agents-local/ai-agents/<version>`. After changing code, bump the version in `.codex-plugin/plugin.json` and re-run `codex plugin add ai-agents@ai-agents-local`. That update step hasn't been exercised yet.
+- Neither copy holds credentials; both read `%USERPROFILE%\.ai-agents`.
+
 Restart the app afterwards. Each session then starts its own `ai_agents_mcp.py --host claude|codex` process. That process registers itself in `state.db` without any model call; list live sessions with `py agent_state.py sessions`.
 
 ### How agents use it
@@ -60,9 +65,12 @@ Behaviour is guided by `skills/discord/SKILL.md` rather than enforced quotas:
   - channel, thread, status edits, attachment, question
   - owner answer detected in the thread
   - read, list, final summary
+- **Installed, 2026-09-30:**
+  - Claude: the plugin server connected in all open sessions.
+  - Codex: a `codex exec` session started the plugin copy, decrypted the token from `~/.ai-agents` and called `list_channels` successfully.
 - **Not yet tested live:**
   - `send_video` transcoding
-  - installation through the Claude/Codex plugin managers, including whether Codex resolves `py`, the environment allowlist in `codex.mcp.json`, and DPAPI under Codex
+  - a full posting session started by a real Claude or Codex agent (as opposed to the scripted MCP client)
 
 ## Webhook quick start (PowerShell)
 
