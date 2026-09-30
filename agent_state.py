@@ -12,7 +12,7 @@ import uuid
 
 # Runtime data lives outside the plugin folder: Claude and Codex each install their own copy of the
 # plugin, but config, token and the session registry must be one shared set.
-ROOT = Path.home() / '.ai-agents'
+ROOT = Path(os.environ['AI_AGENTS_HOME']) if os.environ.get('AI_AGENTS_HOME') else Path.home() / '.ai-agents'
 SCHEMA_VERSION = 1
 SHELLS = {'py.exe', 'pyw.exe', 'python.exe', 'pythonw.exe', 'cmd.exe', 'bash.exe',
           'sh.exe', 'pwsh.exe', 'powershell.exe', 'conhost.exe', 'git-bash.exe'}
