@@ -29,9 +29,10 @@ codex plugin marketplace add C:\Users\user\Desktop\Discord_Agent_Toolkit
 codex plugin add ai-agents@ai-agents-local
 ```
 
-**How each app runs it (observed 2026-09-30):**
-- **Claude Code** runs a local-folder plugin **in place** from this folder. Code changes apply when a session restarts.
-- **Codex** runs a **copy** from `~/.codex/plugins/cache/ai-agents-local/ai-agents/<version>`. After changing code, bump the version in `.codex-plugin/plugin.json` and re-run `codex plugin add ai-agents@ai-agents-local`. That update step hasn't been exercised yet.
+**How each app runs it (corrected 2026-10-01):** both run a **cached copy** of the version installed, not this folder. After changing code, bump the version in both manifests, then:
+- **Claude Code:** `claude plugin marketplace update ai-agents-local`, then `claude plugin update ai-agents@ai-agents-local` (copy in `~/.claude/plugins/cache/ai-agents-local/ai-agents/<version>`).
+- **Codex:** `codex plugin add ai-agents@ai-agents-local` (copy in `~/.codex/plugins/cache/ai-agents-local/ai-agents/<version>`).
+- Then restart the app. `py smoke_test.py` checks both installed versions match the repo (check `installed`).
 - Neither copy holds credentials; both read `%USERPROFILE%\.ai-agents`.
 
 Restart the app afterwards. Each session then starts its own `ai_agents_mcp.py --host claude|codex` process. That process registers itself in `state.db` without any model call; list live sessions with `py agent_state.py sessions`.

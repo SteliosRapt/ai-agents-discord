@@ -173,6 +173,28 @@ def check_listener():
     return reason
 
 
+def check_installed(repo=REPO, home=None):
+    """Both apps run a cached copy of the plugin; it must be the version in this repo."""
+    home = Path.home() if home is None else Path(home)
+    problems, found = [], []
+    claude_expected = json.loads((repo / '.claude-plugin' / 'plugin.json').read_text(encoding='utf-8'))['version']
+    codex_expected = json.loads((repo / '.codex-plugin' / 'plugin.json').read_text(encoding='utf-8'))['version']
+    record = home / '.claude' / 'plugins' / 'installed_plugins.json'
+    entries = (json.loads(record.read_text(encoding='utf-8')).get('plugins', {}) if record.is_file() else {}).get('ai-agents@ai-agents-local', [])
+    claude = entries[0].get('version') if entries else None
+    found.append(f'claude {claude}')
+    if claude != claude_expected:
+        problems.append(f'Claude has {claude}, repo is {claude_expected} (claude plugin marketplace update ai-agents-local; claude plugin update ai-agents@ai-agents-local; restart)')
+    cache = home / '.codex' / 'plugins' / 'cache' / 'ai-agents-local' / 'ai-agents'
+    codex = sorted(d.name for d in cache.iterdir() if d.is_dir()) if cache.is_dir() else []
+    found.append('codex ' + (','.join(codex) or 'none'))
+    if codex != [codex_expected]:
+        problems.append(f'Codex has {codex or "nothing"}, repo is {codex_expected} (codex plugin add ai-agents@ai-agents-local; restart)')
+    if problems:
+        raise CheckFailed('; '.join(problems))
+    return 'installed: ' + ', '.join(found)
+
+
 class Smoke:
     def __init__(self):
         self.config = None
@@ -238,7 +260,7 @@ def main(argv=None):
     parser.add_argument('--offline-only', action='store_true')
     args = parser.parse_args(argv)
     smoke = Smoke()
-    checks = [('config', smoke.check_config)]
+    checks = [('config', smoke.check_config), ('installed', check_installed)]
     if not args.offline_only:
         checks += [('token', smoke.check_token), ('intent', smoke.check_intent),
                    ('access', smoke.check_access), ('commands', smoke.check_commands)]

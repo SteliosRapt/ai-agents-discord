@@ -17,6 +17,7 @@ from mcp.client.stdio import stdio_client as sdk_stdio_client
 import agent_state
 import bot_client
 import smoke_test as smoke
+REAL_CHECK_INSTALLED = smoke.check_installed
 
 TOKEN = 'offline-private-bot-token'
 HOOK = 'https://discord.com/api/webhooks/123/offline-webhook-secret'
@@ -58,6 +59,7 @@ class SmokeTests(unittest.TestCase):
         self.process = self.enterContext(patch.object(smoke.subprocess, 'run', side_effect=self.hook_process))
         self.enterContext(patch.object(smoke.shutil, 'which', side_effect=lambda name: name))
         self.listener = self.enterContext(patch.object(smoke, 'check_listener', return_value='lock held; Gateway ready'))
+        self.enterContext(patch.object(smoke, 'check_installed', return_value='installed: test'))
         self.mcp_runs = []
         self.session = AsyncMock()
         self.session.__aenter__.return_value = self.session
@@ -120,7 +122,7 @@ class SmokeTests(unittest.TestCase):
         code, lines = self.run_main()
         self.assertEqual(code, 0)
         self.assertEqual([line.split(':')[0] for line in lines],
-                         ['PASS ' + name for name in ('config', 'token', 'intent', 'access', 'commands',
+                         ['PASS ' + name for name in ('config', 'installed', 'token', 'intent', 'access', 'commands',
                                                      'mcp-claude', 'mcp-codex', 'hooks', 'listener')])
         self.assertEqual(self.http_calls, ['/users/@me', '/applications/@me', '/guilds/1',
                                           '/channels/3', '/channels/4', '/channels/5',
@@ -138,7 +140,7 @@ class SmokeTests(unittest.TestCase):
         code, lines = self.run_main(['--offline-only'])
         self.assertEqual(code, 0)
         self.assertEqual([line.split(':')[0] for line in lines],
-                         ['PASS config', 'PASS mcp-claude', 'PASS mcp-codex', 'PASS hooks'])
+                         ['PASS config', 'PASS installed', 'PASS mcp-claude', 'PASS mcp-codex', 'PASS hooks'])
         self.http.assert_not_called()
         bot_client.bot_token.assert_not_called()
         self.listener.assert_not_called()
@@ -148,7 +150,7 @@ class SmokeTests(unittest.TestCase):
         self.session.initialize.side_effect = RuntimeError(TOKEN + HOOK)
         code, lines = self.run_main()
         self.assertEqual(code, 1)
-        self.assertEqual(len(lines), 9)
+        self.assertEqual(len(lines), 10)
         for name in ('token', 'intent', 'access', 'commands', 'mcp-claude', 'mcp-codex'):
             self.assertTrue(any(line.startswith('FAIL ' + name + ':') for line in lines))
         self.assertTrue(lines[-2].startswith('PASS hooks:'))
@@ -244,6 +246,28 @@ class SmokeTests(unittest.TestCase):
         for _, kwargs, root, _ in self.hook_runs:
             self.assertEqual(kwargs['env']['PLUGIN_ROOT'], str(smoke.REPO))
             self.assertFalse(root.exists())
+
+    def test_installed_versions_must_match_repo(self):
+        import json, tempfile
+        with tempfile.TemporaryDirectory() as home:
+            home = Path(home)
+            claude = home / '.claude' / 'plugins'; claude.mkdir(parents=True)
+            version = json.loads((smoke.REPO / '.claude-plugin' / 'plugin.json').read_text(encoding='utf-8'))['version']
+            def install(claude_version, codex_versions):
+                (claude / 'installed_plugins.json').write_text(json.dumps({'plugins': {'ai-agents@ai-agents-local': [{'version': claude_version}]}}), encoding='utf-8')
+                cache = home / '.codex' / 'plugins' / 'cache' / 'ai-agents-local' / 'ai-agents'
+                if cache.exists():
+                    import shutil; shutil.rmtree(cache)
+                for v in codex_versions:
+                    (cache / v).mkdir(parents=True)
+            install(version, [version])
+            self.assertIn(f'claude {version}', REAL_CHECK_INSTALLED(home=home))
+            install('0.1.0', [version])
+            with self.assertRaisesRegex(smoke.CheckFailed, 'Claude has 0.1.0'):
+                REAL_CHECK_INSTALLED(home=home)
+            install(version, ['0.1.1'])
+            with self.assertRaisesRegex(smoke.CheckFailed, 'Codex has'):
+                REAL_CHECK_INSTALLED(home=home)
 
     def test_wsl_bash_launcher_is_rejected(self):
         wsl = r'C:\Windows\System32\bash.exe'
