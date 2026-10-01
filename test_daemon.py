@@ -216,6 +216,7 @@ class ListenerTests(unittest.TestCase):
             self.assertEqual(timeout, 55)
             self.assertEqual(request.full_url, 'https://cdn.discordapp.com/attachments/data')
             self.assertIsNone(request.get_header('Authorization'))
+            self.assertEqual(request.get_header('User-agent'), 'DiscordBot (local ai-agents, 1.0)')  # CDN 403s Python's default
             return io.BytesIO(b'data')
 
         self.urlopen.side_effect = download

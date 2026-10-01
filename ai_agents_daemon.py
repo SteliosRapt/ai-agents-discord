@@ -151,7 +151,8 @@ def download(attachment, handle):
     try:
         with part.open('xb') as stream:
             part_created = True
-            with urlopen(urllib.request.Request(url), timeout=55) as response:
+            # Discord's CDN (Cloudflare) answers Python's default User-Agent with 403; found live on the first /send.
+            with urlopen(urllib.request.Request(url, headers={'User-Agent': 'DiscordBot (local ai-agents, 1.0)'}), timeout=55) as response:
                 count = 0
                 while chunk := response.read(65536):
                     stream.write(chunk)
