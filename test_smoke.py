@@ -260,12 +260,14 @@ class SmokeTests(unittest.TestCase):
                     import shutil; shutil.rmtree(cache)
                 for v in codex_versions:
                     (cache / v).mkdir(parents=True)
-            install(version, [version])
+            codex = {'v': version}
+            self.enterContext(patch.object(smoke, 'codex_installed_version', side_effect=lambda: codex['v']))
+            install(version, [version, '0.1.0'])  # a stale cache folder alongside is fine
             self.assertIn(f'claude {version}', REAL_CHECK_INSTALLED(home=home))
             install('0.1.0', [version])
             with self.assertRaisesRegex(smoke.CheckFailed, 'Claude has 0.1.0'):
                 REAL_CHECK_INSTALLED(home=home)
-            install(version, ['0.1.1'])
+            install(version, [version]); codex['v'] = '0.1.1'
             with self.assertRaisesRegex(smoke.CheckFailed, 'Codex has'):
                 REAL_CHECK_INSTALLED(home=home)
 

@@ -173,6 +173,20 @@ def check_listener():
     return reason
 
 
+def codex_installed_version():
+    """Version of ai-agents@ai-agents-local as reported by `codex plugin list`, or None."""
+    program = shutil.which('codex')
+    if program is None:
+        raise CheckFailed('codex not found on PATH')
+    result = subprocess.run([program, 'plugin', 'list'], capture_output=True, encoding='utf-8', errors='replace', timeout=60,
+                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if parts and parts[0] == 'ai-agents@ai-agents-local' and 'installed,' in parts:
+            return next((p for p in parts if p[:1].isdigit()), None)
+    return None
+
+
 def check_installed(repo=REPO, home=None):
     """Both apps run a cached copy of the plugin; it must be the version in this repo."""
     home = Path.home() if home is None else Path(home)
@@ -185,11 +199,11 @@ def check_installed(repo=REPO, home=None):
     found.append(f'claude {claude}')
     if claude != claude_expected:
         problems.append(f'Claude has {claude}, repo is {claude_expected} (claude plugin marketplace update ai-agents-local; claude plugin update ai-agents@ai-agents-local; restart)')
-    cache = home / '.codex' / 'plugins' / 'cache' / 'ai-agents-local' / 'ai-agents'
-    codex = sorted(d.name for d in cache.iterdir() if d.is_dir()) if cache.is_dir() else []
-    found.append('codex ' + (','.join(codex) or 'none'))
-    if codex != [codex_expected]:
-        problems.append(f'Codex has {codex or "nothing"}, repo is {codex_expected} (codex plugin add ai-agents@ai-agents-local; restart)')
+    # Codex may keep an older cache folder while a running session still uses it; its own plugin list is authoritative.
+    codex = codex_installed_version()
+    found.append(f'codex {codex}')
+    if codex != codex_expected:
+        problems.append(f'Codex has {codex}, repo is {codex_expected} (codex plugin add ai-agents@ai-agents-local; restart)')
     if problems:
         raise CheckFailed('; '.join(problems))
     return 'installed: ' + ', '.join(found)
