@@ -10,7 +10,7 @@ Status (2026-10-01): **phases 1–5 implemented, Codex-verified, merged**. See R
 | 4 | Independent Codex security + reliability review: 17 findings fixed, plus 3 races found while verifying |
 | 5 | No-posting live smoke test (`smoke_test.py`), waiting/working/idle state in `/agents` |
 
-Deferred by owner decision: remote task inbox / remote control. Not done (needs owner or low value): per-agent webhook identities (needs Manage Webhooks), message search, forum/digest, moving plugin files into a subfolder so the Codex cache copy excludes `.git`/`.orc`. Sources: Sol second opinion (ask `0930-202129-053`) and Sol web research (full cited report: `.orc/asks/0930-202129-020.final.md`).
+Deferred by owner decision: remote task inbox / remote control. Not done (needs owner or low value): per-agent webhook identities (needs Manage Webhooks), message search, forum/digest, moving plugin files into a subfolder so the Codex cache copy excludes `.git`/`.orc`. Sources: an independent second-opinion review and a web research run.
 
 ## Answers to the direct questions
 

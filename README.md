@@ -199,3 +199,7 @@ Discord receiving a message does not prove the iPhone displayed a push alert. En
 ## Validation
 
 Run `py test_toolkit.py` (and `test_agents`, `test_hooks`, `test_gateway`, `test_daemon`, `test_jobs`) for offline tests of multipart construction, rate-limit retry, oversized upload handling, credential encryption, and conditional video tiers. These tests do not post to Discord. The underlying webhook and DPAPI technique successfully delivered a live test in the original setup. Generic video transcoding requires FFmpeg and has not been exercised on a real movie as part of creating this toolkit; no original render was inspected or changed.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
