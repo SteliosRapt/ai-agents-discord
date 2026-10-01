@@ -487,6 +487,19 @@ class HookTests(unittest.TestCase):
         with patch.object(agent_state.time, 'time', return_value=300):
             self.assertEqual(self.run_hook('UserPromptSubmit', session_id=session), (0, '', ''))
 
+    def test_subagent_events_neither_confirm_nor_receive_inbox(self):
+        session = 'with-subagent'
+        item = self.state.add_inbox(session, self.root / 'file.txt', 'Read this', 'owner')
+        with patch.object(agent_state.time, 'time', return_value=100):
+            self.assertEqual(self.run_hook('PostToolUse', session_id=session, agent_id='sub-1'), (0, '', ''))
+            self.assertIn('Read this', self.run_hook('UserPromptSubmit', session_id=session)[1])
+        with patch.object(agent_state.time, 'time', return_value=200):
+            self.run_hook('PostToolUse', session_id=session, agent_id='sub-1')
+        self.assertIsNone(self.state.db.execute('SELECT confirmed_at FROM inbox WHERE id=?', (item,)).fetchone()[0])
+        with patch.object(agent_state.time, 'time', return_value=300):
+            self.assertEqual(self.run_hook('PostToolUse', session_id=session), (0, '', ''))
+        self.assertEqual(self.state.db.execute('SELECT confirmed_at FROM inbox WHERE id=?', (item,)).fetchone()[0], 300)
+
     def test_hook_retains_delivery_claim_through_remaining_duties(self):
         self.state.add_inbox('host-1', self.root / 'file.txt', 'Read first', 'owner')
         other = agent_state.State(self.root)

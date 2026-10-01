@@ -70,7 +70,12 @@ def main():
     state = agent_state.State()
     inbox_output = False
     try:
-        state.confirm_inbox(session_id, event, event_at)
+        # Subagents report tool events under the parent's session id (Claude and Codex) and mark them with agent_id.
+        # Their steps prove nothing about the main model having seen an injection, and their context is not the
+        # owner's target, so they neither confirm nor receive inbox items.
+        main_agent = not payload.get('agent_id')
+        if main_agent:
+            state.confirm_inbox(session_id, event, event_at)
         row = state.touch_host_session(args.host, session_id, payload['cwd'], agent_state.host_process_pid(), event)
         tool = payload.get('tool_name', '')
         if event == 'PostToolUse' and 'start_session' in tool and ('ai-agents' in tool or 'ai_agents' in tool):
@@ -79,7 +84,7 @@ def main():
             thread = re.search(r'\\*"thread_id\\*"\s*:\s*(?:\\*")?([0-9]+)(?:\\*"|(?=\s*[,}]))', response)
             if mcp and thread:
                 state.link_host_session(session_id, mcp.group(1), thread.group(1), (payload.get('tool_input') or {}).get('title'))
-        if event in ('PostToolUse', 'UserPromptSubmit'):
+        if main_agent and event in ('PostToolUse', 'UserPromptSubmit'):
             rows = state.take_inbox(session_id, retry_before=event_at, event=event)
             if rows:
                 text = 'AI Agents inbox: the owner sent you these via Discord /send\n'
