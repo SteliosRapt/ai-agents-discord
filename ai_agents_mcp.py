@@ -1,6 +1,7 @@
 """Bot-backed AI Agents MCP server. Run with --host claude or --host codex."""
 import argparse
 import atexit
+import hashlib
 from contextvars import ContextVar
 from functools import partial, wraps
 import os
@@ -10,7 +11,7 @@ import threading
 import time
 import anyio
 from mcp.server.fastmcp import FastMCP
-from agent_state import load_config, State, ROOT as DATA
+from agent_state import load_config, State, ProjectChannelBusy, canonical_path, ROOT as DATA
 from bot_client import BotClient, check_content, snowflake
 from discord_client import TooLarge
 from send_video import deliver_video
@@ -24,19 +25,17 @@ def posted(message):
 TOOLKIT = Path(__file__).resolve().parent
 CALL_CANCELLED = ContextVar('call_cancelled', default=None)
 
-def canonical_path(path):
-    """Use the same ordinary Windows spelling for all containment checks."""
-    def strip_extended(value):
-        if value[:8].lower() == '\\\\?\\unc\\':
-            return '\\\\' + value[8:]
-        return value[4:] if value.startswith('\\\\?\\') else value
-    return os.path.normcase(strip_extended(os.path.realpath(strip_extended(os.fspath(path)))))
-
 def contained(path, root):
     try:
         return os.path.commonpath((path, root)) == root
     except ValueError:  # Different drives/shares cannot contain each other.
         return False
+
+def project_channel_name(project):
+    """Recover a channel by full project identity, never by its basename alone."""
+    slug = re.sub(r'[^a-z0-9-]+', '-', project.name.lower()).strip('-')[:34] or 'project'
+    identity = hashlib.sha256(canonical_path(project).encode('utf-8')).hexdigest()
+    return f'{slug}-{identity}'
 
 def async_tool(body):
     @wraps(body)
@@ -104,7 +103,8 @@ class AgentSession:
         """Declare when you will post and your absolute working directory.
 
         Call once before posting with a non-empty notification plan.
-        A failed start must be investigated before opening another session.
+        Retry if another session is creating the project channel. Other failed
+        starts must be investigated before opening another session.
         """
         with self.lock:
             if self.start_attempted:
@@ -120,16 +120,23 @@ class AgentSession:
             starter = f'{self.host} · {title}'
             check_content(starter)
             check_content(plan)
-            name = re.sub(r'[^a-z0-9-]+', '-', project.name.lower()).strip('-')[:90] or 'project'
+            name = project_channel_name(project)
             self.start_attempted = True
             self.state.update(self.id, project_dir=str(project), title=title, plan=plan, status='starting')
             def lookup():
                 return next((channel for channel in self.client.list_guild_channels()
                              if channel.get('type') == 0 and channel.get('name') == name
                              and channel.get('parent_id') == self.config['agents_category_id']), None)
-            channel_id = self.state.project_channel(project,
-                                                    lambda: self.client.create_text_channel(name, self.config['agents_category_id']),
-                                                    lookup=lookup)
+            try:
+                channel_id = self.state.project_channel(project,
+                                                        lambda: self.client.create_text_channel(name, self.config['agents_category_id']),
+                                                        lookup=lookup)
+            except ProjectChannelBusy:
+                # Reservation contention happens before this caller touches Discord.
+                # Do not reset for other errors: a creation/post may have succeeded.
+                self.state.update(self.id, status='connected')
+                self.start_attempted = False
+                raise
             self.state.update(self.id, channel_id=channel_id)
             message = self.client.send_message(channel_id, starter)
             thread = self.client.start_thread_from_message(channel_id, message['id'], title[:100])

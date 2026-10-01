@@ -32,7 +32,8 @@ def deliver_video(video, message, sender, limit_mib=20, ffmpeg='ffmpeg', ffprobe
             continue
         out = copies / f'{source.stem}_{height}p.mp4'
         # Preserve aspect ratio and avoid upscaling. Encoder metadata is not a visual review.
-        vf = f'scale=-2:trunc(min(ih,{height})/2)*2'
+        # Escape the comma for FFmpeg's filtergraph parser even without a shell.
+        vf = rf'scale=-2:trunc(min(ih\,{height})/2)*2'
         with (copies / 'encoding.log').open('ab') as log:
             subprocess.run([ffmpeg, '-y', '-i', str(source), '-map', '0:v:0', '-map', '0:a:0?', '-vf', vf, '-c:v', 'libx264', '-preset', 'medium', '-b:v', f'{bitrate}k', '-maxrate', f'{bitrate}k', '-bufsize', f'{bitrate*2}k', '-c:a', 'aac', '-b:a', f'{audio}k', '-movflags', '+faststart', str(out)], check=True, stdout=log, stderr=log)
         if not 0 < out.stat().st_size <= budget * 1024**2:

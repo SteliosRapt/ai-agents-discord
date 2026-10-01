@@ -17,6 +17,17 @@ SCHEMA_VERSION = 1
 SHELLS = {'py.exe', 'pyw.exe', 'python.exe', 'pythonw.exe', 'cmd.exe', 'bash.exe',
           'sh.exe', 'pwsh.exe', 'powershell.exe', 'conhost.exe', 'git-bash.exe'}
 
+class ProjectChannelBusy(RuntimeError):
+    """Another caller owns the reservation; this caller made no Discord request."""
+
+def canonical_path(path):
+    """Normalize case, aliases and extended prefixes to an ordinary Windows path."""
+    def strip_extended(value):
+        if value[:8].lower() == '\\\\?\\unc\\':
+            return '\\\\' + value[8:]
+        return value[4:] if value.startswith('\\\\?\\') else value
+    return os.path.normcase(strip_extended(os.path.realpath(strip_extended(os.fspath(path)))))
+
 class _ProcessEntry(ctypes.Structure):
     _fields_ = [('dwSize', ctypes.c_ulong), ('cntUsage', ctypes.c_ulong),
                 ('th32ProcessID', ctypes.c_ulong), ('th32DefaultHeapID', ctypes.c_size_t),
@@ -211,15 +222,38 @@ class State:
         Failed requests leave a reservation so a later lookup can recover an
         uncertain Discord creation after the 120-second reservation expires.
         """
-        project_dir, now = str(project_dir), time.time()
+        project_dir, now = canonical_path(project_dir), time.time()
         self.db.execute('BEGIN IMMEDIATE')
         try:
-            row = self.db.execute('SELECT * FROM project_channels WHERE project_dir=?', (project_dir,)).fetchone()
+            # Older records used Path.resolve() spellings, including mixed case
+            # and extended prefixes. Consolidate aliases under the same write
+            # lock as reservation acquisition; historical sessions stay intact.
+            matches = [row for row in self.db.execute('SELECT * FROM project_channels').fetchall()
+                       if canonical_path(row['project_dir']) == project_dir]
+            if any(row['status'] == 'creating' and row['reserved_at'] is not None
+                   and now - row['reserved_at'] < 120 for row in matches):
+                raise ProjectChannelBusy('project channel creation in progress, retry shortly')
+            row = min(matches, key=lambda row: (row['status'] != 'ready', row['created_at'], row['project_dir'])) if matches else None
+            if row and (len(matches) > 1 or row['project_dir'] != project_dir):
+                for alias in matches:
+                    self.db.execute('DELETE FROM project_channels WHERE project_dir=?', (alias['project_dir'],))
+                self.db.execute('INSERT INTO project_channels (project_dir, channel_id, created_at, status, reserved_at) '
+                                'VALUES (?, ?, ?, ?, ?)',
+                                (project_dir, row['channel_id'], row['created_at'], row['status'], row['reserved_at']))
             if row and row['status'] == 'ready':
-                self.db.execute('COMMIT')
-                return row['channel_id']
+                # Older releases could assign one channel to unrelated folders.
+                # Keep a deterministic owner; reserve a separate channel for
+                # other projects without moving messages or existing threads.
+                sharing = self.db.execute("SELECT project_dir FROM project_channels WHERE channel_id=? AND status='ready'",
+                                          (row['channel_id'],)).fetchall()
+                identities = {canonical_path(other['project_dir']) for other in sharing}
+                if project_dir == min(identities):
+                    self.db.execute('COMMIT')
+                    return row['channel_id']
+                # This is a new reservation, not contention with an old ready row.
+                row = None
             if row and row['reserved_at'] is not None and now - row['reserved_at'] < 120:
-                raise RuntimeError('project channel creation in progress, retry shortly')
+                raise ProjectChannelBusy('project channel creation in progress, retry shortly')
             self.db.execute("INSERT INTO project_channels (project_dir, created_at, status, reserved_at) VALUES (?, ?, 'creating', ?) "
                             "ON CONFLICT(project_dir) DO UPDATE SET status='creating', reserved_at=excluded.reserved_at",
                             (project_dir, now, now))

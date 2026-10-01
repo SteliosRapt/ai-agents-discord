@@ -145,7 +145,7 @@ class SessionTests(unittest.TestCase):
         result = self.start(session=second, project=self.project / '..' / self.project.name)
         creations = [c for c in self.http.calls if c[0] == 'POST' and c[1] == '/guilds/1/channels']
         self.assertEqual(len(creations), 1)
-        self.assertEqual(creations[0][2]['name'], 'my-project')
+        self.assertRegex(creations[0][2]['name'], r'^my-project-[0-9a-f]{64}$')
         self.assertEqual(creations[0][2]['parent_id'], '3')
         self.assertEqual(first['channel_id'], result['channel_id'])
         self.assertNotEqual(first['thread_id'], result['thread_id'])
@@ -173,6 +173,97 @@ class SessionTests(unittest.TestCase):
         rows = self.session.state.db.execute('SELECT created_at FROM project_channels').fetchall()
         self.assertEqual(len(rows), 4)
         self.assertTrue(all(row['created_at'] == now for row in rows))
+
+    def test_same_basename_and_normalized_slug_use_separate_channels(self):
+        first = self.start()
+        for relative in ('client-b/My_Project', 'My-Project'):
+            project = self.project.parent / relative
+            project.mkdir(parents=True)
+            _, other = agents.create_server('claude', self.root)
+            self.addCleanup(other.close)
+            result = self.start(other, project)
+            self.assertNotEqual(result['channel_id'], first['channel_id'])
+            self.assert_no_http(lambda: other.read_messages(first['channel_id']), ValueError)
+        self.assertEqual(len({c['name'] for c in self.http.channels}), 3)
+        self.assertEqual(len(self.http.channels), 3)
+
+    def test_existing_legacy_ready_channel_mapping_is_preserved(self):
+        self.session.state.db.execute(
+            "INSERT INTO project_channels (project_dir, channel_id, created_at, status) VALUES (?, '104', 1, 'ready')",
+            (str(self.project.resolve()),))
+        self.http.channels = [{'id': '104', 'name': 'my-project', 'type': 0, 'parent_id': '3'}]
+        self.assertEqual(self.start()['channel_id'], '104')
+        self.assertFalse(any(c[1] == '/guilds/1/channels' for c in self.http.calls))
+
+    def test_unmapped_legacy_basename_channel_is_not_adopted(self):
+        self.http.channels = [{'id': '104', 'name': 'my-project', 'type': 0, 'parent_id': '3'}]
+        self.assertNotEqual(self.start()['channel_id'], '104')
+        self.assertEqual(len(self.http.channels), 2)
+
+    def test_shared_legacy_mapping_is_split_without_changing_existing_threads(self):
+        owner_project = self.project.parent / 'client-a' / 'app'
+        other_project = self.project.parent / 'client-b' / 'app'
+        owner_project.mkdir(parents=True)
+        other_project.mkdir(parents=True)
+        for project in (owner_project, other_project):
+            self.session.state.db.execute(
+                "INSERT INTO project_channels (project_dir, channel_id, created_at, status) VALUES (?, '104', 1, 'ready')",
+                (str(project.resolve()),))
+        historical = self.session.state.register('codex')
+        self.session.state.update(historical, project_dir=str(other_project.resolve()),
+                                  channel_id='104', thread_id='105', status='closed')
+        self.http.channels = [{'id': '104', 'name': 'app', 'type': 0, 'parent_id': '3'}]
+        self.assertEqual(self.session.state.project_channel(
+            owner_project.resolve(), Mock(side_effect=AssertionError('owner must keep legacy channel'))), '104')
+        # Start the non-owner first so retention does not depend on start order.
+        result = self.start(project=other_project)
+        _, owner = agents.create_server('claude', self.root)
+        self.addCleanup(owner.close)
+        owner_result = self.start(owner, owner_project)
+        self.assertEqual(owner_result['channel_id'], '104')
+        self.assertNotEqual(result['channel_id'], '104')
+        self.assert_no_http(lambda: self.session.read_messages('104'), ValueError)
+        self.assert_no_http(lambda: owner.read_messages(result['channel_id']), ValueError)
+        previous = self.session.state.session(historical)
+        self.assertEqual((previous['channel_id'], previous['thread_id']), ('104', '105'))
+        self.assertEqual(len(self.http.channels), 2)
+        self.assertFalse(any(c[0] in ('DELETE', 'PATCH') for c in self.http.calls))
+
+    def test_uncertain_legacy_mapping_split_reconciles_new_channel(self):
+        owner_project = self.project.parent / 'a'
+        other_project = self.project.parent / 'b'
+        owner_project.mkdir()
+        other_project.mkdir()
+        for project in (owner_project, other_project):
+            self.session.state.db.execute(
+                "INSERT INTO project_channels (project_dir, channel_id, created_at, status) VALUES (?, '104', 1, 'ready')",
+                (str(project.resolve()),))
+        self.http.channels = [{'id': '104', 'name': 'app', 'type': 0, 'parent_id': '3'}]
+        original = self.session.client.create_text_channel
+        now = agent_state.time.time()
+        def uncertain(*args):
+            # A competing state connection sees the remapping reservation.
+            state = agent_state.State(self.root)
+            try:
+                with self.assertRaises(agent_state.ProjectChannelBusy):
+                    state.project_channel(other_project.resolve(), Mock(side_effect=AssertionError('duplicate')))
+            finally:
+                state.close()
+            original(*args)
+            raise RuntimeError('delivery uncertain')
+        with patch.object(agent_state.time, 'time', return_value=now), \
+                patch.object(self.session.client, 'create_text_channel', side_effect=uncertain):
+            with self.assertRaisesRegex(RuntimeError, 'delivery uncertain'):
+                self.start(project=other_project)
+        _, retry = agents.create_server('claude', self.root)
+        self.addCleanup(retry.close)
+        with patch.object(agent_state.time, 'time', return_value=now + 120):
+            result = self.start(retry, other_project)
+        self.assertNotEqual(result['channel_id'], '104')
+        self.assertEqual(len(self.http.channels), 2)
+        owner = self.session.state.db.execute('SELECT * FROM project_channels WHERE project_dir=?',
+                                              (str(owner_project.resolve()),)).fetchone()
+        self.assertEqual((owner['channel_id'], owner['status']), ('104', 'ready'))
 
     def test_25_milestones_without_usage_cap(self):
         self.start()
@@ -407,23 +498,95 @@ class SessionTests(unittest.TestCase):
         row = self.session.state.db.execute('SELECT * FROM project_channels').fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row['status'], 'creating')
+        self.assert_no_http(lambda: self.start(), RuntimeError)
         with patch.object(agent_state.time, 'time', return_value=now + 119):
             _, retry = agents.create_server('codex', self.root)
             self.addCleanup(retry.close)
             self.assert_no_http(lambda: self.start(retry), RuntimeError)
         with patch.object(agent_state.time, 'time', return_value=now + 120):
-            _, retry = agents.create_server('codex', self.root)
-            self.addCleanup(retry.close)
             result = self.start(retry)
         self.assertEqual(result['channel_id'], self.http.channels[0]['id'])
         self.assertEqual(len([c for c in self.http.calls if c[0] == 'POST' and c[1] == '/guilds/1/channels']), 1)
         self.assertEqual(self.session.state.db.execute('SELECT status FROM project_channels').fetchone()[0], 'ready')
 
+    def test_concurrent_channel_creation_allows_same_session_retry(self):
+        _, other = agents.create_server('claude', self.root)
+        self.addCleanup(other.close)
+        original = self.session.client.create_text_channel
+        def create(*args):
+            before = self.urlopen.call_count
+            with self.assertRaisesRegex(agent_state.ProjectChannelBusy, 'retry shortly'):
+                self.start(other)
+            self.assertEqual(self.urlopen.call_count, before)
+            self.assertFalse(other.start_attempted)
+            self.assertEqual(other.state.session(other.id)['status'], 'connected')
+            return original(*args)
+        with patch.object(self.session.client, 'create_text_channel', side_effect=create):
+            first = self.start()
+        result = self.start(other)
+        self.assertEqual(first['channel_id'], result['channel_id'])
+        self.assertNotEqual(first['thread_id'], result['thread_id'])
+        self.assertEqual(len(self.http.channels), 1)
+        self.assertEqual(other.state.session(other.id)['status'], 'active')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows extended path syntax')
+    def test_extended_path_alias_shares_reservation_and_retries_without_duplicate(self):
+        extended = Path('\\\\?\\' + str(self.project.resolve()))
+        _, other = agents.create_server('claude', self.root)
+        self.addCleanup(other.close)
+        original = self.session.client.create_text_channel
+        def create(*args):
+            before = self.urlopen.call_count
+            with self.assertRaisesRegex(agent_state.ProjectChannelBusy, 'retry shortly'):
+                self.start(other, extended)
+            self.assertEqual(self.urlopen.call_count, before)
+            self.assertFalse(other.start_attempted)
+            return original(*args)
+        with patch.object(self.session.client, 'create_text_channel', side_effect=create):
+            first = self.start()
+        result = self.start(other, extended)
+        self.assertEqual(result['channel_id'], first['channel_id'])
+        self.assertEqual(len(self.http.channels), 1)
+        rows = self.session.state.db.execute('SELECT * FROM project_channels').fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['project_dir'], agents.canonical_path(self.project))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows extended path syntax')
+    def test_legacy_extended_and_case_alias_mappings_preserve_channel_and_history(self):
+        extended = '\\\\?\\' + str(self.project.resolve())
+        for alias in (extended, str(self.project.resolve()).upper()):
+            self.session.state.db.execute(
+                "INSERT INTO project_channels (project_dir, channel_id, created_at, status) VALUES (?, '104', 1, 'ready')",
+                (alias,))
+        self.session.state.update(self.session.id, project_dir=extended, channel_id='104', thread_id='105')
+        original = self.session.state.session(self.session.id)
+        result = self.session.state.project_channel(self.project, Mock(side_effect=AssertionError('must reuse')))
+        self.assertEqual(result, '104')
+        rows = self.session.state.db.execute('SELECT * FROM project_channels').fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]['project_dir'], rows[0]['channel_id']),
+                         (agents.canonical_path(self.project), '104'))
+        self.assertEqual(dict(self.session.state.session(self.session.id)), dict(original))
+        self.urlopen.assert_not_called()
+
+    def test_uncertain_thread_creation_still_prevents_same_session_retry(self):
+        original = self.session.client.start_thread_from_message
+        def uncertain(*args):
+            original(*args)
+            raise RuntimeError('delivery uncertain')
+        with patch.object(self.session.client, 'start_thread_from_message', side_effect=uncertain):
+            with self.assertRaisesRegex(RuntimeError, 'delivery uncertain'):
+                self.start()
+        self.assertTrue(self.session.start_attempted)
+        self.assert_no_http(lambda: self.start(), RuntimeError)
+        self.assertEqual(len([c for c in self.http.calls if c[1].endswith('/threads')]), 1)
+
     def test_channel_lookup_only_adopts_matching_text_channel_in_category(self):
-        self.http.channels = [{'id': '101', 'name': 'my-project', 'type': 0, 'parent_id': '88'},
-                              {'id': '102', 'name': 'my-project', 'type': 2, 'parent_id': '3'},
+        name = agents.project_channel_name(self.project)
+        self.http.channels = [{'id': '101', 'name': name, 'type': 0, 'parent_id': '88'},
+                              {'id': '102', 'name': name, 'type': 2, 'parent_id': '3'},
                               {'id': '103', 'name': 'other', 'type': 0, 'parent_id': '3'},
-                              {'id': '104', 'name': 'my-project', 'type': 0, 'parent_id': '3'}]
+                              {'id': '104', 'name': name, 'type': 0, 'parent_id': '3'}]
         self.assertEqual(self.start()['channel_id'], '104')
         self.assertFalse(any(c[0] == 'POST' and c[1] == '/guilds/1/channels' for c in self.http.calls))
 

@@ -10,6 +10,15 @@ Neither path falls back to the other.
 ## Plugin (Claude Code + Codex)
 
 ### One-time setup
+Use **Windows with Python 3.11 or newer**. The launcher `py` must select that version for the Windows account running Claude Code/Codex (the plugin launch commands use `py`). From this folder, check the version and install the pinned MCP dependency into that same interpreter:
+
+```powershell
+py --version
+py -m pip install -r requirements.txt
+```
+
+Python 3.10 is unsupported: the toolkit uses Python 3.11's `tomllib`, `datetime.UTC` and `asyncio.timeout`. Webhook-only commands do not require the MCP dependency.
+
 1. **Discord:**
    - Create a private bot (Public Bot off, Install Link = None) with the **Message Content** intent.
    - Invite it with `bot` + `applications.commands` and View Channels, Send Messages, Send Messages in Threads, Create Public Threads, Read Message History, Attach Files, Embed Links and Add Reactions.
@@ -17,7 +26,7 @@ Neither path falls back to the other.
 2. **Config:** copy `config.example.toml` to `%USERPROFILE%\.ai-agents\config.toml` and fill in the server, owner, AGENTS-category and read-channel IDs plus `upload_roots`. All runtime data (config, tokens, `state.db`) lives in that folder, not in the plugin folder: Claude and Codex each install their own copy of the plugin, but share one config, one token and one session registry.
 3. **Token:** run `py bot_client.py setup` and paste the token at the hidden prompt. It is stored DPAPI-encrypted in `%USERPROFILE%\.ai-agents\bot_token.dpapi` and only decrypts under this Windows account. `DISCORD_BOT_TOKEN` in the environment overrides it.
 4. **Check:** run `py bot_client.py doctor`. It makes read-only requests and never prints the token.
-5. **Python:** `mcp` (see `requirements.txt`) must be importable by `py` for the account that runs Claude Code/Codex.
+5. **Python:** confirm `mcp` is importable by `py` for the account that runs Claude Code/Codex: `py -c "import mcp"`.
 
 ### Install
 Both manifests live in this folder: `.claude-plugin/` and `claude.mcp.json` for Claude (deliberately not `.mcp.json`, which Claude would also load as a broken project server when working in this folder); `.codex-plugin/`, `codex.mcp.json` and `.agents/plugins/marketplace.json` for Codex. The skill in `skills/discord/` is shared.
@@ -42,6 +51,12 @@ Behaviour is guided by `skills/discord/SKILL.md` rather than enforced quotas:
 - An agent uses Discord only for long-running work or when asked.
 - It tells you in chat when it will post, then calls `start_session(title, plan, project_dir)`.
 - That creates a channel for the project under AGENTS (once per project folder) and a thread for the session. The plan is posted first.
+
+Project channels use a readable folder-name prefix followed by a hash of the canonical full path, so two projects named `app` have separate channels. Unique existing recorded channel mappings are reused, including channels created with the older basename-only names. If distinct projects already share a recorded legacy channel, the alphabetically first canonical path keeps it and other projects acquire separate channels on their next `start_session`. Existing threads, messages and historical session records remain intact. Remapping uses the same reservation and uncertain-creation recovery as new channels. Unrecorded legacy channels are not adopted by name: after losing the state database, or upgrading with an unresolved legacy creation, check Discord before starting again and reconcile the legacy channel manually to avoid duplicates. A failed new channel creation keeps its reservation for 120 seconds; a later session can reconcile the full-path channel name after that period.
+
+If `start_session` reports that another session is creating the project channel, retry shortly in the same session. That contention happens before this session makes any Discord request. Other startup failures still prevent another attempt in the same process because a channel, message or thread may already have been created; inspect Discord and the recorded session before opening another session.
+
+Channel hashing and database reservations use the same ordinary, case-normalized full-path identity. Regular and `\\?\` extended Windows paths therefore share one reservation and channel. Older case/extended-path mapping aliases are consolidated atomically when that project is next used, retaining the existing channel and historical session records.
 
 | Tool | What it does |
 |---|---|
@@ -130,11 +145,12 @@ Both keys are optional in `config.toml`.
     - Codex 0.4.0 installed
 - **Phase 5, live 2026-10-01:** `py smoke_test.py`: all 9 checks PASS (including 30/30 hook runs across three shells and both MCP launch configs).
 - **Trust assumption:** `%USERPROFILE%\.ai-agents` and its parent folders are not writable by anyone else.
+- **Synthetic video integration, 2026-10-01:** real FFmpeg encoded generated audio and silent fixtures, including fallback after simulated size rejection. Outputs decoded successfully and originals stayed unchanged. This exposed and fixed an unescaped comma in the scale filter; no video was posted to Discord.
 - **Not yet tested live:**
   - `/agents` and `/send` issued from Discord (needs the owner)
   - Phase 3 alerts and `run_and_notify` live status (not posted overnight so your phone stays quiet; offline tests cover payloads and mentions)
   - the model's reply to an injected inbox item (the standalone `claude` CLI login had expired)
-  - `send_video` transcoding
+  - `send_video` upload of a transcoded video to Discord
   - a full posting session started by a real Claude or Codex agent (as opposed to the scripted MCP client)
 
 ## Webhook quick start (PowerShell)
@@ -147,7 +163,7 @@ py send_video.py "C:\path\movie.mp4" --message "Animation finished"
 py run_and_notify.py --name "My job" -- py "C:\path\job.py"
 ```
 
-Python 3.10+ is required. Basic messages and attachments use only the standard library. Video compression additionally needs FFmpeg (with libx264) and ffprobe on PATH; alternatively pass `--ffmpeg C:\path\ffmpeg.exe --ffprobe C:\path\ffprobe.exe`. Get FFmpeg through https://ffmpeg.org/download.html. Compression uses the source video's measured duration, preserves audio if present, and writes separate copies beside the source. No images or previews are generated for review.
+Windows and Python 3.11+ are required. Basic messages and attachments use only the standard library. Video compression additionally needs FFmpeg (with libx264) and ffprobe on PATH; alternatively pass `--ffmpeg C:\path\ffmpeg.exe --ffprobe C:\path\ffprobe.exe`. Get FFmpeg through https://ffmpeg.org/download.html. Compression uses the source video's measured duration, preserves audio if present, and writes separate copies beside the source. No images or previews are generated for review.
 
 To configure another webhook, run `py discord_client.py setup`. Paste its URL at the hidden prompt. Create webhooks in Discord server settings → Integrations → Webhooks, choose the intended channel, and copy the URL. Webhooks post to their configured destination; channel names in scripts do not redirect them.
 
@@ -198,7 +214,11 @@ Discord receiving a message does not prove the iPhone displayed a push alert. En
 
 ## Validation
 
-Run `py test_toolkit.py` (and `test_agents`, `test_hooks`, `test_gateway`, `test_daemon`, `test_jobs`) for offline tests of multipart construction, rate-limit retry, oversized upload handling, credential encryption, and conditional video tiers. These tests do not post to Discord. The underlying webhook and DPAPI technique successfully delivered a live test in the original setup. Generic video transcoding requires FFmpeg and has not been exercised on a real movie as part of creating this toolkit; no original render was inspected or changed.
+Install `requirements.txt`, then run the complete suite with `py -m unittest discover -v`. The tests cover multipart construction, rate limits, uncertain delivery, credential encryption/redaction, concurrent session state, hooks, Gateway recovery, the listener and job monitoring. They do not post to Discord.
+
+`test_video_integration.py` generates temporary video fixtures with and without audio and runs real FFmpeg compression. It checks output size, codecs, dimensions, duration, decoding, fallback after a simulated size rejection, and preservation of the original. It skips locally when FFmpeg/ffprobe are absent; set `AI_AGENTS_REQUIRE_FFMPEG=1` to require them. Windows CI installs FFmpeg and runs the complete suite on Python 3.11 and 3.14, so these integration tests cannot silently skip there. No user video is read or changed.
+
+Offline tests and generated fixtures do not verify live Discord delivery, phone push notifications, or an installed host app consuming inbox context. The live checks and remaining manual validation are listed under "Tested" above.
 
 ## License
 
