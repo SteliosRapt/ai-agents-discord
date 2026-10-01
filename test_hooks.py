@@ -310,7 +310,8 @@ class StateTests(unittest.TestCase):
                 migrated_columns = [tuple(row) for row in state.db.execute('PRAGMA table_info(project_channels)')]
                 self.assertEqual(migrated_columns[:len(project_columns)], project_columns)
                 self.assertEqual([column[1] for column in migrated_columns[len(project_columns):]], ['status', 'reserved_at'])
-                project = state.db.execute("SELECT * FROM project_channels WHERE project_dir='project'").fetchone()
+                project = state.db.execute('SELECT * FROM project_channels WHERE project_dir=?',
+                                           (agent_state.canonical_path('project'),)).fetchone()
                 self.assertEqual((project['channel_id'], project['created_at'], project['status'], project['reserved_at']),
                                  ('100', 1, 'ready', None))
                 self.assertEqual(state.db.execute('PRAGMA user_version').fetchone()[0], agent_state.SCHEMA_VERSION)
