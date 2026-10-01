@@ -246,7 +246,8 @@ class StateTests(unittest.TestCase):
                 with patch.object(agent_state.time, 'time', return_value=10):
                     state.confirm_inbox('old-host', 'PostToolUse', 10)
                     rows = state.take_inbox('old-host', retry_before=10, event='PostToolUse')
-                self.assertEqual([(row['id'], row['delivered_at']) for row in rows], [(1, None), (2, 2)])
+                # The PostToolUse after row 2's delivery proves the model ran, so only the undelivered row is sent.
+                self.assertEqual([(row['id'], row['delivered_at']) for row in rows], [(1, None)])
                 with patch.object(agent_state.time, 'time', return_value=10):
                     state.finish_inbox()
                 state.confirm_inbox('old-host', 'PostToolUse', 11)
@@ -459,24 +460,32 @@ class HookTests(unittest.TestCase):
             with patch.object(agent_state.time, 'time', return_value=101):
                 self.assertEqual(self.run_hook('Stop', session_id='linked'), (0, '', ''))
 
-    def test_prompt_delivery_replays_then_tool_delivery_confirms(self):
-        for next_event in ('UserPromptSubmit', 'PostToolUse'):
-            with self.subTest(next_event=next_event):
-                session = 'replay-' + next_event
-                item = self.state.add_inbox(session, self.root / 'file.txt', 'Read this', 'owner')
-                with patch.object(agent_state.time, 'time', return_value=100):
-                    code, out, err = self.run_hook('UserPromptSubmit', session_id=session)
-                self.assertEqual((code, err), (0, ''))
-                self.assertNotIn('(re-sent)', out)
-                with patch.object(agent_state.time, 'time', return_value=200):
-                    code, out, err = self.run_hook(next_event, session_id=session)
-                self.assertEqual((code, err), (0, ''))
-                self.assertIn('(re-sent)', json.loads(out)['hookSpecificOutput']['additionalContext'])
-                with patch.object(agent_state.time, 'time', return_value=300):
-                    self.assertEqual(self.run_hook('Stop', session_id=session), (0, '', ''))
-                with patch.object(agent_state.time, 'time', return_value=400):
-                    self.assertEqual(self.run_hook('UserPromptSubmit', session_id=session), (0, '', ''))
-                self.assertEqual(self.state.db.execute('SELECT confirmed_at FROM inbox WHERE id=?', (item,)).fetchone()[0], 300)
+    def test_prompt_delivery_replays_only_without_model_activity(self):
+        # Next prompt with no tool step/Stop in between: the turn died before the model ran -> re-send once.
+        session = 'replay-prompt'
+        item = self.state.add_inbox(session, self.root / 'file.txt', 'Read this', 'owner')
+        with patch.object(agent_state.time, 'time', return_value=100):
+            code, out, err = self.run_hook('UserPromptSubmit', session_id=session)
+        self.assertEqual((code, err), (0, ''))
+        self.assertNotIn('(re-sent)', out)
+        with patch.object(agent_state.time, 'time', return_value=200):
+            code, out, err = self.run_hook('UserPromptSubmit', session_id=session)
+        self.assertIn('(re-sent)', json.loads(out)['hookSpecificOutput']['additionalContext'])
+        with patch.object(agent_state.time, 'time', return_value=300):
+            self.assertEqual(self.run_hook('Stop', session_id=session), (0, '', ''))
+        self.assertEqual(self.state.db.execute('SELECT confirmed_at FROM inbox WHERE id=?', (item,)).fetchone()[0], 300)
+
+    def test_tool_step_after_prompt_delivery_confirms_without_duplicate(self):
+        # Found live: a /send delivered at UserPromptSubmit was re-sent at the next PostToolUse.
+        session = 'confirm-by-tool'
+        item = self.state.add_inbox(session, self.root / 'file.txt', 'Read this', 'owner')
+        with patch.object(agent_state.time, 'time', return_value=100):
+            self.assertIn('Read this', self.run_hook('UserPromptSubmit', session_id=session)[1])
+        with patch.object(agent_state.time, 'time', return_value=200):
+            self.assertEqual(self.run_hook('PostToolUse', session_id=session), (0, '', ''))
+        self.assertEqual(self.state.db.execute('SELECT confirmed_at FROM inbox WHERE id=?', (item,)).fetchone()[0], 200)
+        with patch.object(agent_state.time, 'time', return_value=300):
+            self.assertEqual(self.run_hook('UserPromptSubmit', session_id=session), (0, '', ''))
 
     def test_hook_retains_delivery_claim_through_remaining_duties(self):
         self.state.add_inbox('host-1', self.root / 'file.txt', 'Read first', 'owner')

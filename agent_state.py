@@ -288,13 +288,12 @@ class State:
                                (host_session_id, str(path), note, sender_id, time.time())).lastrowid
 
     def confirm_inbox(self, host_session_id, event, before):
-        """A tool step proves progress after tool delivery; Stop also confirms prompt delivery."""
+        """A later tool step or Stop proves the model ran after the delivery."""
         if event not in ('PostToolUse', 'Stop'):
             return
         sql = 'SELECT * FROM inbox WHERE host_session_id=? AND confirmed_at IS NULL AND delivered_at<? AND delivery_pid IS NULL'
-        if event == 'PostToolUse':
-            # A failed prompt may never reach the model; replay it at the first successful tool step.
-            sql += " AND COALESCE(delivered_event, 'UserPromptSubmit') <> 'UserPromptSubmit'"
+        # Any later tool step or Stop means the model ran after the delivery (prompt-time or tool-time),
+        # so it saw the context; only a delivery followed by no model activity is replayed.
         self.db.execute('BEGIN IMMEDIATE')
         try:
             rows = self.db.execute(sql, (host_session_id, before)).fetchall()
